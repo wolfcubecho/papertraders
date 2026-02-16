@@ -62,25 +62,44 @@ const CONFIG = {
     atrPeriod: 14,
   },
 
-  // Momentum thresholds
+  // ═══════════════════════════════════════════════════════════════
+  // QUANT-LEVEL MOMENTUM THRESHOLDS
+  // ═══════════════════════════════════════════════════════════════
   momentum: {
-    volumeSpikeMultiple: 1.5,      // Lowered from 1.8x for 4H timeframe
+    // Volume spike: lowered for 4H timeframe (1.2x = 20% above average)
+    volumeSpikeMultiple: 1.2,
     volumeAvgPeriod: 20,
+
+    // RSI: Standard settings for swing timeframe
     rsiPeriod: 14,
     rsiBullishCross: 50,
     rsiBearishCross: 50,
     rsiOverbought: 70,
     rsiOversold: 30,
+
+    // EMA: Fast/slow for trend detection
     emaFast: 9,
     emaSlow: 21,
+
+    // Bollinger Bands: Mean reversion extremes (25%/75% for swing)
     bbPeriod: 20,
     bbStdDev: 2,
+    bbExtremeLong: 0.25,   // 25% = LONG entry in RANGE mode (was 20%)
+    bbExtremeShort: 0.75,  // 75% = SHORT entry in RANGE mode (was 80%)
+
+    // MACD: Momentum confirmation
     macdFast: 12,
     macdSlow: 26,
     macdSignal: 9,
+
+    // Price breakout: Lookback for swing high/low breaks
     breakoutLookback: 10,
+
+    // Candle momentum: Body ratio for strong candles
     minBodyRatio: 0.6,
-    minSignals: 1,                  // Lowered from 2 for more entries
+
+    // Minimum signals for direction confirmation
+    minSignals: 1,
   },
 
   // ML - set to 0 for data collection (bypass)
@@ -763,6 +782,7 @@ function applySMCContext(
   smcAnalysis: any,
   ictAnalysis: any,
   isKillZone: boolean,
+  weeklyAlignmentScore: number = 0.5,  // 0 = opposing, 0.5 = neutral, 1 = aligned
 ): SMCContext {
   const ctx: SMCContext = {
     stopTighten: 1.0,
@@ -770,6 +790,20 @@ function applySMCContext(
     confidenceBoost: 0,
     adjustments: [],
   };
+
+  // ═══════════════════════════════════════════════════════════════
+  // QUANT-LEVEL: Weekly trend is ALWAYS an adjustment, never a gate
+  // ═══════════════════════════════════════════════════════════════
+  if (weeklyAlignmentScore < 0.3) {
+    // Opposing weekly trend -> smaller position, tighter stop (risk management)
+    ctx.sizeMultiplier *= 0.6;
+    ctx.stopTighten *= 0.85;
+    ctx.adjustments.push(`WeeklyOpposing: -40%size,SL-15%`);
+  } else if (weeklyAlignmentScore >= 0.8) {
+    // Aligned weekly trend -> confidence boost
+    ctx.confidenceBoost += 5;
+    ctx.adjustments.push(`WeeklyAligned: +5conf`);
+  }
 
   if (!smcAnalysis || !ictAnalysis) return ctx;
 
@@ -1342,12 +1376,14 @@ class CoinTrader {
       weeklyAlignmentScore = 0.5;  // Neutral default
     }
 
-    // Skip if strongly aligned against weekly trend
-    if (weeklyAlignmentScore === 0 && weeklyTrend !== 'SIDE') {
-      return noEntry(`Weekly ${weeklyTrend} trend opposes ${direction}`, direction, regime, 0.5, 40, { stopTighten: 1, sizeMultiplier: 1, confidenceBoost: 0, adjustments: [] });
-    }
+    // ═══════════════════════════════════════════════════════════════
+    // QUANT-LEVEL: Weekly trend is ADVISORY, not a hard gate
+    // - Opposing weekly trend → smaller position, tighter stop (risk management)
+    // - Aligned weekly trend → confidence boost
+    // - Never block trades purely on weekly alignment (miss too many opportunities)
+    // ═══════════════════════════════════════════════════════════════
 
-    // CHOP: Don't trade
+    // CHOP: Don't trade (no edge in dead markets)
     if (regime === 'CHOP') {
       return noEntry(`CHOP: ATR ${(m4h.atrPercent * 100).toFixed(2)}% < ${(CONFIG.regime.minVolatility * 100).toFixed(1)}% - skip`, direction, 'CHOP');
     }
@@ -1401,18 +1437,18 @@ class CoinTrader {
       // ═══════════════════════════════════════════════════════════════
       // RANGE MODE: Mean reversion at BB extremes + volume spike
       // Direction OVERRIDDEN by BB position (mean reversion logic):
-      //   BB < 20% → LONG (buy oversold), BB > 80% → SHORT (sell overbought)
+      //   BB < 25% → LONG (buy oversold), BB > 75% → SHORT (sell overbought)
       // ═══════════════════════════════════════════════════════════════
 
       let rangeDirection: 'LONG' | 'SHORT' | 'SKIP' = 'SKIP';
-      if (m4h.bbPosition < 0.20) {
+      if (m4h.bbPosition < CONFIG.momentum.bbExtremeLong) {
         rangeDirection = 'LONG';
-      } else if (m4h.bbPosition > 0.80) {
+      } else if (m4h.bbPosition > CONFIG.momentum.bbExtremeShort) {
         rangeDirection = 'SHORT';
       }
 
       if (rangeDirection === 'SKIP') {
-        return { ...noEntry(`RANGE: BB in middle (${(m4h.bbPosition * 100).toFixed(0)}%) - need <20% or >80%`, direction, 'RANGE'), signals };
+        return { ...noEntry(`RANGE: BB in middle (${(m4h.bbPosition * 100).toFixed(0)}%) - need <${(CONFIG.momentum.bbExtremeLong * 100).toFixed(0)}% or >${(CONFIG.momentum.bbExtremeShort * 100).toFixed(0)}%`, direction, 'RANGE'), signals };
       }
 
       // Override direction for mean reversion
@@ -1432,7 +1468,7 @@ class CoinTrader {
       tf4h.ictAnalysis = ICTIndicators.analyzeFast(tf4h.candles, tf4h.smcAnalysis);
     }
 
-    const smcContext = applySMCContext(direction as 'LONG' | 'SHORT', tf4h.smcAnalysis, tf4h.ictAnalysis, m4h.isKillZone);
+    const smcContext = applySMCContext(direction as 'LONG' | 'SHORT', tf4h.smcAnalysis, tf4h.ictAnalysis, m4h.isKillZone, weeklyAlignmentScore);
 
     // Calculate quality score (will be updated with weekly alignment later)
     const qualityScore = this.calculateTradeQuality(m4h, weeklyAlignmentScore, smcContext);
