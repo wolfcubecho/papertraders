@@ -72,7 +72,13 @@ fi
 # Install LightGBM
 echo "📦 Installing LightGBM (Python ML library)..."
 if ! python3 -c "import lightgbm" 2>/dev/null; then
-  pip3 install lightgbm
+  # Try apt first (available in Ubuntu 24.04+)
+  if apt install -y python3-lightgbm 2>/dev/null; then
+    echo "   ✅ LightGBM installed via apt"
+  else
+    # Fallback: Use pip with --break-system-packages for externally-managed env
+    pip3 install --break-system-packages lightgbm
+  fi
 else
   echo "   ✅ LightGBM already installed"
 fi
