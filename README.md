@@ -1,32 +1,31 @@
-# Learning Orchestrator
+# Paper Traders
 
-An advanced ML-powered trading strategy evolution system that uses genetic algorithms and H2O machine learning to continuously evolve trading strategies based on historical cryptocurrency data.
+Multi-coin automated paper trading system for cryptocurrency with regime-based entries, momentum indicators, and ML integration.
 
 ## Overview
 
-This orchestrator implements an automated learning loop that:
-1. **Fetches historical data** from Binance for multiple cryptocurrency pairs
-2. **Evolves trading strategies** using genetic algorithms
-3. **Trains ML models** using H2O (Random Forest and Gradient Boosting)
-4. **Backtests strategies** to evaluate performance
-5. **Iterates continuously** to improve strategies over time
+Paper traders simulate live trading without real money:
+- **5m Momentum Scalper**: Quick trades (0.25% SL, 0.75-1.8R targets)
+- **4h Swing Trader**: Regime-based entries with SMC context
+- **LightGBM ML**: Optional win probability filtering
+- **Performance Analytics**: Track by regime, session, day of week
 
 ## Features
 
-- **Multi-timeframe analysis**: 1m, 5m, 1h, 1d intervals
-- **Technical indicators**: RSI, MACD, Bollinger Bands, SMA/EMA, ATR, etc.
-- **Genetic algorithm optimization**: Evolves strategy parameters
-- **Ensemble ML voting**: Combines multiple model predictions
-- **Reinforcement learning**: Position sizing based on ML confidence
-- **Smart Money Concepts (SMC)**: Market structure analysis
-- **Automated backtesting**: Weekly evaluation cycles
+- **Regime Detection**: TREND/RANGE/CHOP using ATR + ADX
+- **Momentum Indicators**: RSI, EMA, MACD, Bollinger Bands, VWAP
+- **Smart Money Concepts**: Used as trade adjusters (not entry gates)
+- **Kelly Sizing**: Position sizing based on real trade statistics
+- **Trailing Stops**: Activated after TP1, only updates on candle close
+- **Partial Closes**: 50% at TP1, 25% at TP2, 25% at TP3
+- **Multi-Timeframe**: 1m, 5m, 15m for scalper | 4h, 1d, 1w for swing
 
 ## Prerequisites
 
-- Node.js 18+
-- Python 3.8+
-- H2O-3 (auto-installed via pip)
-- npm
+- Node.js 20+
+- Python 3.8+ (for LightGBM)
+- LightGBM (pip3 install lightgbm)
+- Binance API with futures permissions
 
 ## Installation
 
@@ -35,9 +34,16 @@ This orchestrator implements an automated learning loop that:
 For fresh Ubuntu/Debian servers, use the automated installer:
 
 ```bash
-# Clone and run the installer
-git clone https://github.com/wolfcubecho/learning-orchestrator.git
-cd learning-orchestrator
+# Clone and run the installer (use SSH or PAT for auth)
+git clone git@github.com:wolfcubecho/papertraders.git
+cd papertraders
+sudo ./install-ubuntu.sh
+```
+
+Or with Personal Access Token:
+```bash
+git clone https://YOUR_TOKEN@github.com/wolfcubecho/papertraders.git
+cd papertraders
 sudo ./install-ubuntu.sh
 ```
 
@@ -56,43 +62,26 @@ pm2 save
 pm2 startup  # Run the command it outputs for auto-start on boot
 ```
 
-### Option 1: Using Trading Stack Installer (Recommended)
-
-The easiest way to install Learning Orchestrator is through the main trading-stack installer:
-
-```bash
-# Linux/macOS
-./install.sh
-
-# Windows
-.\install.ps1
-```
-
-The installer will:
-- Clone this repository
-- Install Node.js dependencies
-- Install Python dependencies (pyarrow, pandas, requests, h2o)
-- Download historical data (see note below)
-- Build the project
-
-### Option 2: Manual Installation
+### Manual Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/wolfcubecho/learning-orchestrator.git
-cd learning-orchestrator
+git clone git@github.com:wolfcubecho/papertraders.git
+cd papertraders
 
 # Install Node.js dependencies
 npm install
 
 # Install Python dependencies
-pip install pyarrow pandas requests h2o
-
-# Download historical data (required)
-python scripts/fetch-historical-data.py
+pip3 install lightgbm
 
 # Build the project
 npm run build
+
+# Create .env file
+cp .env.example .env
+# Edit .env with your Binance API keys
+nano .env
 ```
 
 ## ⚠️ Important: Historical Data
@@ -186,7 +175,7 @@ python scripts/h2o_predict.py
 ## Project Structure
 
 ```
-learning-orchestrator/
+papertraders/
 ├── src/                          # TypeScript source code
 │   ├── cli.ts                    # Command-line interface
 │   ├── backtest-learn-loop.ts    # Main learning loop
