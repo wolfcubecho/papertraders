@@ -57,8 +57,8 @@ const CONFIG = {
   // MOMENTUM THRESHOLDS
   // ═══════════════════════════════════════════════════════════════
   momentum: {
-    // Volume spike detection
-    volumeSpikeMultiple: 1.2,      // Volume > 1.2x average = spike (lowered for 5m timeframe)
+    // Volume spike detection (QUANT-LEVEL: 1.1x for more entries with quality edge)
+    volumeSpikeMultiple: 1.1,      // Volume > 1.1x average = spike (optimized for 5m timeframe)
     volumeAvgPeriod: 20,           // 20-candle average for comparison
 
     // RSI settings
@@ -168,6 +168,9 @@ interface MomentumSignals {
   rsiBearishCross: boolean;
   rsiOverbought: boolean;
   rsiOversold: boolean;
+  williamsR: number;              // Williams %R: -100 to 0, <-80 oversold, >-20 overbought
+  williamsROversold: boolean;
+  williamsROverbought: boolean;
   emaFast: number;
   emaSlow: number;
   emaBullishCross: boolean;
@@ -260,6 +263,29 @@ function calculateRSI(candles: Candle[], period: number): number[] {
   }
 
   return rsi;
+}
+
+function calculateWilliamsR(candles: Candle[], period: number): number[] {
+  const williamsR: number[] = [];
+
+  if (candles.length < period) {
+    return williamsR;
+  }
+
+  for (let i = period - 1; i < candles.length; i++) {
+    const slice = candles.slice(i - period + 1, i + 1);
+    const highestHigh = Math.max(...slice.map(c => c.high));
+    const lowestLow = Math.min(...slice.map(c => c.low));
+    const currentClose = candles[i].close;
+
+    // Williams %R: -100 * (highestHigh - currentClose) / (highestHigh - lowestLow)
+    // Range: -100 (most oversold) to 0 (most overbought)
+    const range = highestHigh - lowestLow;
+    const wr = range === 0 ? -50 : -100 * (highestHigh - currentClose) / range;
+    williamsR.push(wr);
+  }
+
+  return williamsR;
 }
 
 function calculateEMA(candles: Candle[], period: number): number[] {
@@ -657,6 +683,7 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
       volumeSpike: false, volumeRatio: 1,
       rsiValue: 50, rsiBullishCross: false, rsiBearishCross: false,
       rsiOverbought: false, rsiOversold: false,
+      williamsR: -50, williamsROversold: false, williamsROverbought: false,
       emaFast: 0, emaSlow: 0, emaBullishCross: false, emaBearishCross: false,
       emaAligned: 'neutral',
       bbUpper: 0, bbLower: 0, bbMiddle: 0, bbPosition: 0.5,
@@ -695,6 +722,13 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   const rsiBearishCross = prevRsi > cfg.rsiBearishCross && rsiValue <= cfg.rsiBearishCross;
   const rsiOverbought = rsiValue >= cfg.rsiOverbought;
   const rsiOversold = rsiValue <= cfg.rsiOversold;
+
+  // Williams %R (momentum oscillator: -100 to 0, <-80 oversold, >-20 overbought)
+  const williamsRValues = calculateWilliamsR(candles, cfg.rsiPeriod);
+  const williamsR = williamsRValues[williamsRValues.length - 1] || -50;
+  const prevWilliamsR = williamsRValues[williamsRValues.length - 2] || -50;
+  const williamsROverbought = williamsR > -20;
+  const williamsROversold = williamsR < -80;
 
   // EMA crossover
   const emaFastValues = calculateEMA(candles, cfg.emaFast);
@@ -800,6 +834,10 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   if (rsiBullishCross || rsiOversold) bullishSignals++;
   if (rsiBearishCross || rsiOverbought) bearishSignals++;
 
+  // Williams %R
+  if (williamsROversold) bullishSignals++;        // Williams %R < -80 = oversold
+  if (williamsROverbought) bearishSignals++;      // Williams %R > -20 = overbought
+
   // EMA
   if (emaBullishCross || emaAligned === 'bullish') bullishSignals++;
   if (emaBearishCross || emaAligned === 'bearish') bearishSignals++;
@@ -838,6 +876,7 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   return {
     volumeSpike, volumeRatio,
     rsiValue, rsiBullishCross, rsiBearishCross, rsiOverbought, rsiOversold,
+    williamsR, williamsROversold, williamsROverbought,
     emaFast, emaSlow, emaBullishCross, emaBearishCross, emaAligned,
     bbUpper, bbLower, bbMiddle, bbPosition, bbBreakoutUp, bbBreakoutDown,
     priceBreakoutUp, priceBreakoutDown,

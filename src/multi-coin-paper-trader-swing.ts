@@ -66,8 +66,8 @@ const CONFIG = {
   // QUANT-LEVEL MOMENTUM THRESHOLDS
   // ═══════════════════════════════════════════════════════════════
   momentum: {
-    // Volume spike: lowered for 4H timeframe (1.2x = 20% above average)
-    volumeSpikeMultiple: 1.2,
+    // Volume spike: 1.1x for 4H timeframe (QUANT-LEVEL: optimized for swing entries)
+    volumeSpikeMultiple: 1.1,
     volumeAvgPeriod: 20,
 
     // RSI: Standard settings for swing timeframe
@@ -146,6 +146,9 @@ interface MomentumSignals {
   rsiBearishCross: boolean;
   rsiOverbought: boolean;
   rsiOversold: boolean;
+  williamsR: number;              // Williams %R: -100 to 0, <-80 oversold, >-20 overbought
+  williamsROversold: boolean;
+  williamsROverbought: boolean;
   emaFast: number;
   emaSlow: number;
   emaBullishCross: boolean;
@@ -226,6 +229,29 @@ function calculateRSI(candles: Candle[], period: number): number[] {
   }
 
   return rsi;
+}
+
+function calculateWilliamsR(candles: Candle[], period: number): number[] {
+  const williamsR: number[] = [];
+
+  if (candles.length < period) {
+    return williamsR;
+  }
+
+  for (let i = period - 1; i < candles.length; i++) {
+    const slice = candles.slice(i - period + 1, i + 1);
+    const highestHigh = Math.max(...slice.map(c => c.high));
+    const lowestLow = Math.min(...slice.map(c => c.low));
+    const currentClose = candles[i].close;
+
+    // Williams %R: -100 * (highestHigh - currentClose) / (highestHigh - lowestLow)
+    // Range: -100 (most oversold) to 0 (most overbought)
+    const range = highestHigh - lowestLow;
+    const wr = range === 0 ? -50 : -100 * (highestHigh - currentClose) / range;
+    williamsR.push(wr);
+  }
+
+  return williamsR;
 }
 
 function calculateEMA(candles: Candle[], period: number): number[] {
@@ -579,6 +605,7 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
       volumeSpike: false, volumeRatio: 1,
       rsiValue: 50, rsiBullishCross: false, rsiBearishCross: false,
       rsiOverbought: false, rsiOversold: false,
+      williamsR: -50, williamsROversold: false, williamsROverbought: false,
       emaFast: 0, emaSlow: 0, emaBullishCross: false, emaBearishCross: false,
       emaAligned: 'neutral',
       bbUpper: 0, bbLower: 0, bbMiddle: 0, bbPosition: 0.5,
@@ -617,6 +644,13 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   const rsiBearishCross = prevRsi > cfg.rsiBearishCross && rsiValue <= cfg.rsiBearishCross;
   const rsiOverbought = rsiValue >= cfg.rsiOverbought;
   const rsiOversold = rsiValue <= cfg.rsiOversold;
+
+  // Williams %R (momentum oscillator: -100 to 0, <-80 oversold, >-20 overbought)
+  const williamsRValues = calculateWilliamsR(candles, cfg.rsiPeriod);
+  const williamsR = williamsRValues[williamsRValues.length - 1] || -50;
+  const prevWilliamsR = williamsRValues[williamsRValues.length - 2] || -50;
+  const williamsROverbought = williamsR > -20;
+  const williamsROversold = williamsR < -80;
 
   // EMA crossover
   const emaFastValues = calculateEMA(candles, cfg.emaFast);
@@ -715,6 +749,8 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   if (volumeSpike && candleMomentum === 'bearish') bearishSignals++;
   if (rsiBullishCross || rsiOversold) bullishSignals++;
   if (rsiBearishCross || rsiOverbought) bearishSignals++;
+  if (williamsROversold) bullishSignals++;        // Williams %R < -80 = oversold
+  if (williamsROverbought) bearishSignals++;      // Williams %R > -20 = overbought
   if (emaBullishCross || emaAligned === 'bullish') bullishSignals++;
   if (emaBearishCross || emaAligned === 'bearish') bearishSignals++;
   if (bbBreakoutUp) bullishSignals++;
@@ -743,6 +779,7 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   return {
     volumeSpike, volumeRatio,
     rsiValue, rsiBullishCross, rsiBearishCross, rsiOverbought, rsiOversold,
+    williamsR, williamsROversold, williamsROverbought,
     emaFast, emaSlow, emaBullishCross, emaBearishCross, emaAligned,
     bbUpper, bbLower, bbMiddle, bbPosition, bbBreakoutUp, bbBreakoutDown,
     priceBreakoutUp, priceBreakoutDown,
@@ -1470,6 +1507,24 @@ class CoinTrader {
 
     const smcContext = applySMCContext(direction as 'LONG' | 'SHORT', tf4h.smcAnalysis, tf4h.ictAnalysis, m4h.isKillZone, weeklyAlignmentScore);
 
+    // ═══════════════════════════════════════════════════════════════
+    // QUANT-LEVEL: Multi-Timeframe (MTF) alignment position sizing
+    // Daily alignment affects position size, not entry decision
+    // ═══════════════════════════════════════════════════════════════
+    const dailyTf = this.state.timeframes.get('1d');
+    const dailyAligns = dailyTf && dailyTf.momentum.direction === direction;
+
+    // Apply MTF position sizing adjustment
+    if (!dailyAligns && dailyTf) {
+      // Daily doesn't align → smaller position (50%)
+      smcContext.sizeMultiplier *= 0.5;
+      smcContext.adjustments.push(`MTF-4h/1d-mismatch: -50%size`);
+    } else if (dailyAligns) {
+      // Daily aligns → confidence boost
+      smcContext.confidenceBoost += 3;
+      signals.push('1d');
+    }
+
     // Calculate quality score (will be updated with weekly alignment later)
     const qualityScore = this.calculateTradeQuality(m4h, weeklyAlignmentScore, smcContext);
 
@@ -1515,11 +1570,6 @@ class CoinTrader {
         reason: `ML reject: ${(mlPrediction * 100).toFixed(0)}% < ${(CONFIG.minWinProbability * 100).toFixed(0)}%`,
       };
     }
-
-    // Daily alignment check (boost, not gate)
-    const dailyTf = this.state.timeframes.get('1d');
-    const dailyAligns = dailyTf && dailyTf.momentum.direction === direction;
-    if (dailyAligns) signals.push('1d');
 
     if (m4h.isKillZone) signals.push(`KZ:${m4h.killZone}`);
     if (m4h.volumeSpike && regime === 'TREND') signals.push(`VOL:${m4h.volumeRatio.toFixed(1)}x`);
@@ -1738,8 +1788,8 @@ class CoinTrader {
     // Kelly calculation (can be negative if edge is negative)
     let kellyFraction = (b * p - q) / b;
 
-    // Safety: don't over-bet, use half-Kelly for drawdown protection
-    kellyFraction = Math.max(0, Math.min(0.15, kellyFraction * 0.5));  // Cap at 15% max (half-Kelly)
+    // Safety: don't over-bet, use quarter-Kelly for better risk-adjusted returns
+    kellyFraction = Math.max(0, Math.min(0.15, kellyFraction * 0.25));  // Cap at 15% max (quarter-Kelly)
 
     // Convert Kelly fraction to risk % (5% base when Kelly = 10%)
     let kellyRiskPct = 5.0 * (kellyFraction / 0.10);
