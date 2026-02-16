@@ -222,6 +222,11 @@ interface MomentumSignals {
   swingHigh: number | null;   // Most recent swing high for SHORT stops
   swingLow: number | null;    // Most recent swing low for LONG stops
 
+  // Order Flow Imbalance (OFI) - Market microstructure edge
+  ofi: number;                // Order Flow Imbalance: -1 (bearish) to +1 (bullish)
+  ofiStrongBullish: boolean;  // OFI > 0.3 = strong buying pressure
+  ofiStrongBearish: boolean;  // OFI < -0.3 = strong selling pressure
+
   // Aggregated
   bullishSignals: number;
   bearishSignals: number;
@@ -286,6 +291,63 @@ function calculateWilliamsR(candles: Candle[], period: number): number[] {
   }
 
   return williamsR;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ORDER FLOW IMBALANCE (OFI) - Market Microstructure Edge
+// ═══════════════════════════════════════════════════════════════
+
+interface OrderBookDepth {
+  bids: [price: number, quantity: number][];
+  asks: [price: number, quantity: number][];
+}
+
+interface OFISignal {
+  ofi: number;              // -1 to +1, positive = bullish
+  ofiStrongBullish: boolean; // OFI > 0.3
+  ofiStrongBearish: boolean; // OFI < -0.3
+}
+
+/**
+ * Calculate Order Flow Imbalance from order book depth
+ * OFI = (bid_volume - ask_volume) / (bid_volume + ask_volume)
+ * Uses top N levels for calculation (default 5)
+ */
+function calculateOFI(depth: OrderBookDepth, levels: number = 5): OFISignal {
+  const bids = depth.bids.slice(0, levels);
+  const asks = depth.asks.slice(0, levels);
+
+  // Calculate total bid and ask volumes
+  const bidVolume = bids.reduce((sum, [price, qty]) => sum + price * qty, 0);
+  const askVolume = asks.reduce((sum, [price, qty]) => sum + price * qty, 0);
+
+  const totalVolume = bidVolume + askVolume;
+
+  // OFI: -1 (all asks) to +1 (all bids)
+  const ofi = totalVolume > 0 ? (bidVolume - askVolume) / totalVolume : 0;
+
+  return {
+    ofi,
+    ofiStrongBullish: ofi > 0.3,
+    ofiStrongBearish: ofi < -0.3,
+  };
+}
+
+/**
+ * Fetch order book depth from Binance REST API
+ * Returns top 20 levels (bids and asks)
+ */
+async function fetchOrderBookDepth(client: any, symbol: string): Promise<OrderBookDepth | null> {
+  try {
+    const depth = await client.depth({ symbol, limit: 20 });
+    return {
+      bids: depth.bids.map((b: [string, string]) => [parseFloat(b[0]), parseFloat(b[1])]),
+      asks: depth.asks.map((a: [string, string]) => [parseFloat(a[0]), parseFloat(a[1])]),
+    };
+  } catch (error: any) {
+    console.error(`Error fetching order book for ${symbol}:`, error.message);
+    return null;
+  }
 }
 
 function calculateEMA(candles: Candle[], period: number): number[] {
@@ -674,7 +736,7 @@ function findSwingPoints(candles: Candle[], lookback: number = 5): SwingPoints {
   return { recentSwingHigh, recentSwingLow, swingHighIdx, swingLowIdx };
 }
 
-function analyzeMomentum(candles: Candle[]): MomentumSignals {
+function analyzeMomentum(candles: Candle[], ofiSignal?: OFISignal): MomentumSignals {
   const cfg = CONFIG.momentum;
   const len = candles.length;
 
@@ -700,6 +762,7 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
       currentSession: 'asia' as 'asia' | 'london' | 'ny',
       killZone: 'OFF_HOURS' as const, isKillZone: false,
       swingHigh: null, swingLow: null,
+      ofi: 0, ofiStrongBullish: false, ofiStrongBearish: false,
       bullishSignals: 0, bearishSignals: 0,
       direction: 'NEUTRAL', strength: 0,
     };
@@ -838,6 +901,10 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   if (williamsROversold) bullishSignals++;        // Williams %R < -80 = oversold
   if (williamsROverbought) bearishSignals++;      // Williams %R > -20 = overbought
 
+  // Order Flow Imbalance (OFI) - market microstructure edge
+  if (ofiSignal?.ofiStrongBullish) bullishSignals++;   // OFI > 0.3 = strong buying
+  if (ofiSignal?.ofiStrongBearish) bearishSignals++;   // OFI < -0.3 = strong selling
+
   // EMA
   if (emaBullishCross || emaAligned === 'bullish') bullishSignals++;
   if (emaBearishCross || emaAligned === 'bearish') bearishSignals++;
@@ -895,6 +962,9 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
     killZone, isKillZone,
     swingHigh: swingPoints.recentSwingHigh,
     swingLow: swingPoints.recentSwingLow,
+    ofi: ofiSignal?.ofi ?? 0,
+    ofiStrongBullish: ofiSignal?.ofiStrongBullish ?? false,
+    ofiStrongBearish: ofiSignal?.ofiStrongBearish ?? false,
     bullishSignals, bearishSignals,
     direction, strength,
   };
@@ -995,6 +1065,9 @@ interface TimeframeData {
   candles: Candle[];
   momentum: MomentumSignals;
   lastUpdate: number;
+  // Order book depth for OFI calculation (updated periodically)
+  orderBookDepth: OrderBookDepth | null;
+  lastOFIUpdate: number;
 }
 
 interface CoinTradingState {
@@ -1049,6 +1122,8 @@ class CoinTrader {
         candles: [],
         momentum: analyzeMomentum([]),
         lastUpdate: 0,
+        orderBookDepth: null,
+        lastOFIUpdate: 0,
       });
     }
   }
@@ -1126,13 +1201,44 @@ class CoinTrader {
         volume: parseFloat(c.volume),
       }));
 
-      tf.momentum = analyzeMomentum(tf.candles);
+      // Calculate OFI if we have order book depth
+      const ofiSignal = tf.orderBookDepth ? calculateOFI(tf.orderBookDepth) : undefined;
+      tf.momentum = analyzeMomentum(tf.candles, ofiSignal);
       tf.lastUpdate = now;
     } catch (e: any) {
       if (!e.message?.includes('ENOTFOUND')) {
         console.error(`  ${this.state.symbol}/${interval}: Fetch error:`, e.message);
       }
     }
+  }
+
+  // Fetch and update Order Flow Imbalance (every 15 seconds to avoid rate limits)
+  async updateOFI(client: any): Promise<OFISignal | null> {
+    const now = Date.now();
+    const ofiUpdateInterval = 15000; // 15 seconds
+    const primary = this.state.timeframes.get(CONFIG.primaryInterval);
+
+    if (!primary) return null;
+    if (now - primary.lastOFIUpdate < ofiUpdateInterval) {
+      // Use cached OFI if available
+      if (primary.orderBookDepth) {
+        return calculateOFI(primary.orderBookDepth);
+      }
+      return null;
+    }
+
+    try {
+      const depth = await fetchOrderBookDepth(client, this.state.symbol);
+      if (depth) {
+        primary.orderBookDepth = depth;
+        primary.lastOFIUpdate = now;
+        return calculateOFI(depth);
+      }
+    } catch (e: any) {
+      // Silently fail - OFI is optional enhancement
+    }
+
+    return null;
   }
 
   async tick(client: any): Promise<{ status: string; details: string }> {
@@ -1165,6 +1271,12 @@ class CoinTrader {
       const remaining = Math.round((this.state.cooldownUntil - Date.now()) / 1000);
       return { status: 'COOLDOWN', details: `${remaining}s remaining` };
     }
+
+    // Update Order Flow Imbalance (market microstructure edge)
+    await this.updateOFI(client);
+    // Recalculate momentum with fresh OFI data
+    const ofiSignal = primary.orderBookDepth ? calculateOFI(primary.orderBookDepth) : undefined;
+    primary.momentum = analyzeMomentum(primary.candles, ofiSignal);
 
     // Analyze for entry
     const analysis = this.analyzeForEntry();
