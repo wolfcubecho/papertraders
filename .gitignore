@@ -9,6 +9,7 @@ node_modules/
 # Data files - generated during runtime, don't track
 data/
 Historical_Data/
+Historical_Data_Lite/
 
 # ML models - trained weights, don't track
 data/models/
