@@ -59,10 +59,11 @@ const CONFIG = {
   // REPORTING MODE
   // ═══════════════════════════════════════════════════════════════
   reporting: {
-    mode: 'summary',               // 'summary' = clean output, 'verbose' = all coins
+    mode: 'verbose',               // 'verbose' = all coins (default), 'summary' = clean output
     showOpenTrades: true,          // Always show open trade details
     showStreaks: true,             // Show current win/loss streak
     showRecent: true,              // Show last 10 trades performance
+    summaryFile: path.join(process.cwd(), 'data', 'paper-trades-summary-swing-live.json'),  // Live summary for OpenClaw
   },
 
   // Regime detection
@@ -138,7 +139,7 @@ const CONFIG = {
 
   // AUTO-LEARNING
   autoLearn: {
-    enabled: true,
+    enabled: false,                // DISABLED - Collecting data with new quant features (Williams %R, OFI, 1.1x vol, 25% Kelly)
     triggerEveryNTrades: 50,       // Retrain after every 50 closed trades (swing trades less frequent)
     minTradesForTraining: 30,     // Need at least 30 trades to train
   },
@@ -961,6 +962,123 @@ function captureSnapshot(m: MomentumSignals, price: number): MarketSnapshot {
     direction: m.direction,
     strength: m.strength,
   };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LIVE SUMMARY (for OpenClaw integration)
+// ═══════════════════════════════════════════════════════════════
+
+interface LiveSummary {
+  timestamp: string;
+  cycle: number;
+  trader: 'swing';
+  openTrades: number;
+  totalTrades: number;
+  totalWins: number;
+  totalLosses: number;
+  winRate: number;
+  totalPnl: number;
+  currentStreak: { type: 'WIN' | 'LOSS' | 'NONE'; count: number; };
+  recentPerformance: { trades: number; wins: number; winRate: number; pnl: number; };
+  openPositions: Array<{
+    symbol: string;
+    direction: 'LONG' | 'SHORT';
+    entryPrice: number;
+    currentPrice: number;
+    unrealizedPnl: number;
+    pnlPercent: number;
+  }>;
+}
+
+function writeLiveSummary(
+  traders: CoinTrader[],
+  iteration: number,
+  results: Array<{ symbol: string; price: number; trader: CoinTrader }>
+): void {
+  // Calculate summary metrics
+  const openCount = traders.filter(t => t.state.openTrade).length;
+  const totalPnl = traders.reduce((sum, t) => sum + t.state.stats.totalPnl, 0);
+  const totalTrades = traders.reduce((sum, t) => sum + t.state.stats.totalTrades, 0);
+  const totalWins = traders.reduce((sum, t) => sum + t.state.stats.wins, 0);
+  const totalLosses = traders.reduce((sum, t) => sum + t.state.stats.losses, 0);
+  const winRate = totalTrades > 0 ? (totalWins / totalTrades) * 100 : 0;
+
+  // Calculate current streak
+  const allTrades = traders.flatMap(t => t.state.trades).filter(t => t.status === 'CLOSED');
+  let currentStreak = 0;
+  let currentStreakType: 'WIN' | 'LOSS' | 'NONE' = 'NONE';
+  for (let i = allTrades.length - 1; i >= 0; i--) {
+    const pnl = allTrades[i].pnl || 0;
+    if (currentStreak === 0) {
+      currentStreakType = pnl >= 0 ? 'WIN' : 'LOSS';
+      currentStreak++;
+    } else if ((currentStreakType === 'WIN' && pnl >= 0) || (currentStreakType === 'LOSS' && pnl < 0)) {
+      currentStreak++;
+    } else {
+      break;
+    }
+  }
+
+  // Calculate recent performance (last 10 trades)
+  const recentTrades = allTrades.slice(-10);
+  const recentWins = recentTrades.filter(t => (t.pnl || 0) > 0).length;
+  const recentWinRate = recentTrades.length > 0 ? (recentWins / recentTrades.length) * 100 : 0;
+  const recentPnl = recentTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+
+  // Open positions
+  const openPositions: LiveSummary['openPositions'] = [];
+  for (const { symbol, price, trader } of results) {
+    if (trader.state.openTrade) {
+      const trade = trader.state.openTrade;
+      const isLong = trade.direction === 'LONG';
+      const currentPrice = price > 0 ? price : trade.entryPrice;
+      const priceDiff = isLong ? currentPrice - trade.entryPrice : trade.entryPrice - currentPrice;
+      const unrealizedPnl = priceDiff * (trade.currentPositionSize || 1);
+      const pnlPercent = trade.entryPrice > 0 ? (priceDiff / trade.entryPrice) * 100 : 0;
+      openPositions.push({
+        symbol,
+        direction: trade.direction,
+        entryPrice: trade.entryPrice,
+        currentPrice,
+        unrealizedPnl: Math.round(unrealizedPnl * 100) / 100,
+        pnlPercent: Math.round(pnlPercent * 100) / 100,
+      });
+    }
+  }
+
+  const summary: LiveSummary = {
+    timestamp: new Date().toISOString(),
+    cycle: iteration,
+    trader: 'swing',
+    openTrades: openCount,
+    totalTrades,
+    totalWins,
+    totalLosses,
+    winRate: Math.round(winRate * 10) / 10,
+    totalPnl: Math.round(totalPnl * 100) / 100,
+    currentStreak: {
+      type: currentStreakType,
+      count: currentStreak,
+    },
+    recentPerformance: {
+      trades: recentTrades.length,
+      wins: recentWins,
+      winRate: Math.round(recentWinRate * 10) / 10,
+      pnl: Math.round(recentPnl * 100) / 100,
+    },
+    openPositions,
+  };
+
+  // Write to file
+  try {
+    const summaryDir = path.dirname(CONFIG.reporting.summaryFile);
+    if (!fs.existsSync(summaryDir)) {
+      fs.mkdirSync(summaryDir, { recursive: true });
+    }
+    fs.writeFileSync(CONFIG.reporting.summaryFile, JSON.stringify(summary, null, 2));
+  } catch (e) {
+    // Silently fail - this is optional reporting
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2542,6 +2660,17 @@ class MultiCoinOrchestrator {
         console.log(`           Recent (10): ${recentWinRate}% | ${recentPnlSign}$${recentPnl.toFixed(2)}`);
         console.log('═══════════════════════════════════════════════════════════════\n');
       }
+
+      // ═══════════════════════════════════════════════════════════════
+      // LIVE SUMMARY: Write to JSON file for OpenClaw integration
+      // ═══════════════════════════════════════════════════════════════
+      const tradersArray = Array.from(this.traders.values());
+      const resultsWithTraders = results.map(({ symbol, price, result }) => ({
+        symbol,
+        price,
+        trader: this.traders.get(symbol)!,
+      }));
+      writeLiveSummary(tradersArray, this.cycleCount, resultsWithTraders);
 
       // Regime distribution + filter diagnostic every 10 cycles
       if (this.cycleCount % 10 === 0) {
