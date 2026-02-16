@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+
+# Environment files (API keys, secrets) - NEVER COMMIT THESE!
+.env
+.env.local
+.env.*.local
+
+# Data files - generated during runtime, don't track
+data/
+Historical_Data/
+
+# ML models - trained weights, don't track
+data/models/
+*.pt
+*.pth
+*.onnx
+*.bin
+*.txt
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+
+# Build output
+dist/
+*.js
+!*.d.ts
+!install-ubuntu.sh
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

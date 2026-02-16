@@ -1,0 +1,55 @@
+{
+  "name": "learning-orchestrator",
+  "version": "1.0.0",
+  "description": "Self-learning trading strategy evolution system with A/B testing and backtesting",
+  "type": "module",
+  "main": "dist/cli.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "backtest": "node dist/backtest-runner.js",
+    "evolve": "node dist/evolution-runner.js",
+    "ml-backtest": "node dist/ml-backtest-runner.js",
+    "h2o-pipeline": "node dist/unified-h2o-pipeline.js",
+    "h2o-service": "node dist/h2o-learning-service.js",
+    "ml-advisor": "node dist/ml-trade-advisor.js",
+    "learn-loop": "node dist/backtest-learn-loop.js",
+    "paper-trade": "node dist/paper-trader.js",
+    "paper-trade-multi": "node dist/multi-coin-paper-trader.js",
+    "paper-trade-multi-swing": "node dist/multi-coin-paper-trader-swing.js",
+    "paper-trade-multi-scalp": "node dist/multi-coin-paper-trader-scalp.js",
+    "paper-trade-multi-both": "node dist/run-paper-traders.js",
+    "export-paper-trades-scalp": "node dist/export-paper-trades-scalp-to-training.js",
+    "export-paper-trades-swing": "node dist/export-paper-trades-swing-to-training.js",
+    "export-historical-trades": "node dist/export-historical-trades-to-csv.js",
+    "train-lgbm": "python scripts/lightgbm_trainer.py",
+    "train-lgbm-walkforward": "python scripts/lightgbm_walkforward.py",
+    "train-scalp": "npm run export-paper-trades-scalp && python scripts/lightgbm_walkforward.py --input data/h2o-training/paper_scalp_*.csv --force-save",
+    "train-swing": "npm run export-paper-trades-swing && python scripts/lightgbm_walkforward.py --input data/h2o-training/paper_swing_*.csv --force-save",
+    "train-cnn-lstm": "python scripts/cnn_lstm_trainer.py",
+    "eval-lgbm": "python scripts/lightgbm_evaluate.py",
+    "lgbm-server": "python src/lightgbm-server.py",
+    "test-model": "node dist/test-saved-model.js",
+    "batch-validate": "node dist/batch-validate.js",
+    "status": "node dist/cli.js status",
+    "evaluate": "node dist/cli.js evaluate"
+  },
+  "keywords": [
+    "trading",
+    "machine-learning",
+    "backtesting",
+    "evolution",
+    "strategy-optimization"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "binance-api-node": "^0.12.0",
+    "dotenv": "^16.0.0"
+  }
+}
