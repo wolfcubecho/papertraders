@@ -54,6 +54,16 @@ const CONFIG = {
   minCandlesRequired: 50,          // Need less history for momentum
 
   // ═══════════════════════════════════════════════════════════════
+  // REPORTING MODE
+  // ═══════════════════════════════════════════════════════════════
+  reporting: {
+    mode: 'summary',               // 'summary' = clean output, 'verbose' = all coins
+    showOpenTrades: true,          // Always show open trade details
+    showStreaks: true,             // Show current win/loss streak
+    showRecent: true,              // Show last 10 trades performance
+  },
+
+  // ═══════════════════════════════════════════════════════════════
   // MOMENTUM THRESHOLDS
   // ═══════════════════════════════════════════════════════════════
   momentum: {
@@ -337,15 +347,20 @@ function calculateOFI(depth: OrderBookDepth, levels: number = 5): OFISignal {
  * Fetch order book depth from Binance REST API
  * Returns top 20 levels (bids and asks)
  */
-async function fetchOrderBookDepth(client: any, symbol: string): Promise<OrderBookDepth | null> {
+async function fetchOrderBookDepth(_client: any, symbol: string): Promise<OrderBookDepth | null> {
   try {
-    const depth = await client.depth({ symbol, limit: 20 });
+    // Use Binance REST API directly for order book depth
+    const response = await fetch(`https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=20`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const data = await response.json() as { bids: [string, string][]; asks: [string, string][] };
     return {
-      bids: depth.bids.map((b: [string, string]) => [parseFloat(b[0]), parseFloat(b[1])]),
-      asks: depth.asks.map((a: [string, string]) => [parseFloat(a[0]), parseFloat(a[1])]),
+      bids: data.bids.map((b: [string, string]) => [parseFloat(b[0]), parseFloat(b[1])]),
+      asks: data.asks.map((a: [string, string]) => [parseFloat(a[0]), parseFloat(a[1])]),
     };
   } catch (error: any) {
-    console.error(`Error fetching order book for ${symbol}:`, error.message);
+    // Silently fail - OFI is optional enhancement
     return null;
   }
 }
@@ -2217,46 +2232,80 @@ async function main() {
       }
     }
 
-    // Display each coin status
-    for (const { symbol, price, result, trader } of results) {
-      const priceDisplay = price > 0 ? `$${price.toFixed(getDecimalPlaces(price))}` : 'N/A';
-      let statusLine = `${symbol.padEnd(10)}: ${priceDisplay.padEnd(14)} | `;
+    // ═══════════════════════════════════════════════════════════════
+    // DISPLAY: Summary mode (clean) or Verbose mode (all coins)
+    // ═══════════════════════════════════════════════════════════════
+    const isVerbose = CONFIG.reporting.mode === 'verbose';
 
-      if (trader.state.openTrade) {
-        const trade = trader.state.openTrade;
+    // Show open trades (always shown)
+    const openTrades = results.filter(({ trader }) => trader.state.openTrade);
+    if (openTrades.length > 0) {
+      console.log('⚡ OPEN TRADES:');
+      for (const { symbol, price, trader } of openTrades) {
+        const trade = trader.state.openTrade!;
         const isLong = trade.direction === 'LONG';
-        const currentPrice = price > 0 ? price : trade.entryPrice;  // Fallback to entry if no price
+        const currentPrice = price > 0 ? price : trade.entryPrice;
         const priceDiff = isLong ? currentPrice - trade.entryPrice : trade.entryPrice - currentPrice;
         const unrealizedPnl = priceDiff * (trade.currentPositionSize || 1);
         const pnlPercent = trade.entryPrice > 0 ? (priceDiff / trade.entryPrice) * 100 : 0;
         const pnlSign = unrealizedPnl >= 0 ? '+' : '';
         const pricePrecision = getDecimalPlaces(trade.entryPrice);
-        const nextTp = !trade.tp1Hit ? trade.takeProfit1
-          : !trade.tp2Hit ? trade.takeProfit2
-          : trade.takeProfit3;
-        const tpLabel = !trade.tp1Hit ? 'TP1'
-          : !trade.tp2Hit ? 'TP2'
-          : 'TP3';
-        const tpHits = [trade.tp1Hit ? 'TP1' : '', trade.tp2Hit ? 'TP2' : ''].filter(Boolean).join('+');
-        const trailInfo = trade.trailingStop ? ` TR:$${trade.trailingStop.toFixed(pricePrecision)}` : '';
-        statusLine += `OPEN ${trade.direction.padEnd(5)} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(2)}%) | SL:$${trade.stopLoss.toFixed(pricePrecision)} ${tpLabel}:$${nextTp.toFixed(pricePrecision)}${tpHits ? ` [${tpHits}]` : ''}${trailInfo}`;
-      } else {
-        statusLine += `${result.status.padEnd(10)} | ${result.details}`;
+        console.log(`   ${symbol}: ${trade.direction} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(2)}%) | SL:$${trade.stopLoss.toFixed(pricePrecision)}`);
       }
-
-      console.log(statusLine);
     }
 
-    // Summary
+    // Show all coins only in verbose mode
+    if (isVerbose) {
+      console.log('\n📡 SCANNING:');
+      for (const { symbol, price, result, trader } of results) {
+        if (trader.state.openTrade) continue; // Skip open trades (already shown)
+        const priceDisplay = price > 0 ? `$${price.toFixed(getDecimalPlaces(price))}` : 'N/A';
+        console.log(`   ${symbol.padEnd(10)}: ${priceDisplay.padEnd(14)} | ${result.status.padEnd(10)} | ${result.details}`);
+      }
+    } else {
+      const scanCount = results.filter(({ trader }) => !trader.state.openTrade).length;
+      console.log(`\n📡 SCANNING: ${scanCount} coins (use verbose mode for details)`);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // SUMMARY: Enhanced metrics
+    // ═══════════════════════════════════════════════════════════════
     const openCount = traders.filter(t => t.state.openTrade).length;
     const totalPnl = traders.reduce((sum, t) => sum + t.state.stats.totalPnl, 0);
     const totalTrades = traders.reduce((sum, t) => sum + t.state.stats.totalTrades, 0);
     const totalWins = traders.reduce((sum, t) => sum + t.state.stats.wins, 0);
+    const totalLosses = traders.reduce((sum, t) => sum + t.state.stats.losses, 0);
     const winRate = totalTrades > 0 ? (totalWins / totalTrades * 100).toFixed(1) : '0.0';
     const pnlSign = totalPnl >= 0 ? '+' : '';
+    const pnlColor = totalPnl >= 0 ? '🟢' : '🔴';
+
+    // Calculate current streak
+    const allTrades = traders.flatMap(t => t.state.trades).filter(t => t.status === 'CLOSED');
+    let currentStreak = 0;
+    let currentStreakType = 'NONE';
+    for (let i = allTrades.length - 1; i >= 0; i--) {
+      const pnl = allTrades[i].pnl || 0;
+      if (currentStreak === 0) {
+        currentStreakType = pnl >= 0 ? 'WIN' : 'LOSS';
+        currentStreak++;
+      } else if ((currentStreakType === 'WIN' && pnl >= 0) || (currentStreakType === 'LOSS' && pnl < 0)) {
+        currentStreak++;
+      } else {
+        break;
+      }
+    }
+
+    // Calculate recent performance (last 10 trades)
+    const recentTrades = allTrades.slice(-10);
+    const recentWins = recentTrades.filter(t => (t.pnl || 0) > 0).length;
+    const recentWinRate = recentTrades.length > 0 ? (recentWins / recentTrades.length * 100).toFixed(0) : '0';
+    const recentPnl = recentTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+    const recentPnlSign = recentPnl >= 0 ? '+' : '';
 
     console.log('\n═══════════════════════════════════════════════════════════════');
-    console.log(`📊 SUMMARY: Open: ${openCount} | Trades: ${totalTrades} (${totalWins}W) | Win: ${winRate}% | PnL: ${pnlSign}$${totalPnl.toFixed(2)}`);
+    console.log(`📊 SUMMARY: Open: ${openCount} | Trades: ${totalTrades} (${totalWins}W/${totalLosses}L) | Win: ${winRate}%`);
+    console.log(`           PnL: ${pnlColor} ${pnlSign}$${totalPnl.toFixed(2)} | Streak: ${currentStreakType} (${currentStreak})`);
+    console.log(`           Recent (10): ${recentWinRate}% | ${recentPnlSign}$${recentPnl.toFixed(2)}`);
     console.log('═══════════════════════════════════════════════════════════════\n');
 
     // ═══════════════════════════════════════════════════════════════

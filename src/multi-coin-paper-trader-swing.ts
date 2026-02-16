@@ -55,6 +55,16 @@ const CONFIG = {
   checkIntervalMs: 30000,
   minCandlesRequired: 50,
 
+  // ═══════════════════════════════════════════════════════════════
+  // REPORTING MODE
+  // ═══════════════════════════════════════════════════════════════
+  reporting: {
+    mode: 'summary',               // 'summary' = clean output, 'verbose' = all coins
+    showOpenTrades: true,          // Always show open trade details
+    showStreaks: true,             // Show current win/loss streak
+    showRecent: true,              // Show last 10 trades performance
+  },
+
   // Regime detection
   regime: {
     volatilityThreshold: 0.025,  // 2.5% ATR/price = TREND mode (4H scale)
@@ -2401,6 +2411,15 @@ class MultiCoinOrchestrator {
   }
 
   async run(): Promise<void> {
+    const getDecimalPlaces = (p: number): number => {
+      if (p >= 1000) return 2;
+      if (p >= 100) return 2;
+      if (p >= 10) return 3;
+      if (p >= 1) return 4;
+      return 5;
+    };
+
+    this.running = true;
     this.running = true;
     console.log('Starting regime swing trading loop...');
     console.log(`   Checking every ${CONFIG.checkIntervalMs / 1000}s`);
@@ -2430,46 +2449,98 @@ class MultiCoinOrchestrator {
         trader.saveState();
       }
 
-      // Display each coin status with regime
-      for (const { symbol, price, result } of results) {
+      // ═══════════════════════════════════════════════════════════════
+      // DISPLAY: Summary mode (clean) or Verbose mode (all coins)
+      // ═══════════════════════════════════════════════════════════════
+      const isVerbose = CONFIG.reporting.mode === 'verbose';
+
+      // Show open trades (always shown)
+      const openTrades = results.filter(({ symbol }) => {
         const trader = this.traders.get(symbol)!;
-
-        const getDecimalPlaces = (p: number): number => {
-          if (p >= 1000) return 2;
-          if (p >= 100) return 2;
-          if (p >= 10) return 3;
-          if (p >= 1) return 4;
-          return 5;
-        };
-
-        const priceDisplay = price > 0 ? `$${price.toFixed(getDecimalPlaces(price))}` : 'N/A';
-        const regimeDisplay = (result.regime || '?').padEnd(5);
-
-        let statusLine = `${symbol.padEnd(10)}: ${priceDisplay.padEnd(12)} | ${regimeDisplay} | `;
-
-        if (trader.state.openTrade) {
-          const trade = trader.state.openTrade;
+        return trader.state.openTrade;
+      });
+      if (openTrades.length > 0) {
+        console.log('⚡ OPEN TRADES:');
+        for (const { symbol, price } of openTrades) {
+          const trader = this.traders.get(symbol)!;
+          const trade = trader.state.openTrade!;
           const isLong = trade.direction === 'LONG';
-          const priceDiff = isLong
-            ? price - trade.entryPrice
-            : trade.entryPrice - price;
+          const priceDiff = isLong ? price - trade.entryPrice : trade.entryPrice - price;
           const unrealizedPnl = priceDiff * trade.currentPositionSize;
           const pnlPercent = (priceDiff / trade.entryPrice) * 100;
           const pnlSign = unrealizedPnl >= 0 ? '+' : '';
           const pricePrecision = getDecimalPlaces(price);
-          const trailInfo = trade.trailingStop ? ` TR:$${trade.trailingStop.toFixed(pricePrecision)}` : '';
-          statusLine += `OPEN ${trade.direction.padEnd(6)} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(1)}%) | SL:$${trade.stopLoss.toFixed(pricePrecision)}${trailInfo}`;
-        } else {
-          statusLine += `${result.details}`;
+          console.log(`   ${symbol}: ${trade.direction} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(1)}%) | SL:$${trade.stopLoss.toFixed(pricePrecision)}`);
         }
-
-        console.log(statusLine);
       }
 
-      // Summary every 5 cycles
-      if (this.cycleCount % 5 === 0) {
-        console.log();
-        this.printSummary();
+      // Show all coins only in verbose mode
+      if (isVerbose) {
+        console.log('\n📡 SCANNING:');
+        for (const { symbol, price, result } of results) {
+          const trader = this.traders.get(symbol)!;
+          if (trader.state.openTrade) continue; // Skip open trades (already shown)
+          const priceDisplay = price > 0 ? `$${price.toFixed(getDecimalPlaces(price))}` : 'N/A';
+          const regimeDisplay = (result.regime || '?').padEnd(5);
+          console.log(`   ${symbol.padEnd(10)}: ${priceDisplay.padEnd(12)} | ${regimeDisplay} | ${result.details}`);
+        }
+      } else {
+        const scanCount = results.filter(({ symbol }) => {
+          const trader = this.traders.get(symbol)!;
+          return !trader.state.openTrade;
+        }).length;
+        console.log(`\n📡 SCANNING: ${scanCount} coins (use verbose mode for details)`);
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // SUMMARY: Enhanced metrics (every cycle, not every 5)
+      // ═══════════════════════════════════════════════════════════════
+      if (true) {  // Show summary every cycle
+        const openCount = openTrades.length;
+        let totalPnl = 0, totalTrades = 0, totalWins = 0, totalLosses = 0;
+        for (const [symbol, trader] of this.traders) {
+          totalPnl += trader.state.stats.totalPnl;
+          totalTrades += trader.state.stats.totalTrades;
+          totalWins += trader.state.stats.wins;
+          totalLosses += trader.state.stats.losses;
+        }
+        const winRate = totalTrades > 0 ? (totalWins / totalTrades * 100).toFixed(1) : '0.0';
+        const pnlSign = totalPnl >= 0 ? '+' : '';
+        const pnlColor = totalPnl >= 0 ? '🟢' : '🔴';
+
+        // Calculate current streak
+        const allTrades: PaperTrade[] = [];
+        for (const [, trader] of this.traders) {
+          allTrades.push(...trader.state.trades.filter(t => t.status === 'CLOSED'));
+        }
+        allTrades.sort((a, b) => (a.exitTime || 0) - (b.exitTime || 0));
+
+        let currentStreak = 0;
+        let currentStreakType = 'NONE';
+        for (let i = allTrades.length - 1; i >= 0; i--) {
+          const pnl = allTrades[i].pnl || 0;
+          if (currentStreak === 0) {
+            currentStreakType = pnl >= 0 ? 'WIN' : 'LOSS';
+            currentStreak++;
+          } else if ((currentStreakType === 'WIN' && pnl >= 0) || (currentStreakType === 'LOSS' && pnl < 0)) {
+            currentStreak++;
+          } else {
+            break;
+          }
+        }
+
+        // Calculate recent performance (last 10 trades)
+        const recentTrades = allTrades.slice(-10);
+        const recentWins = recentTrades.filter(t => (t.pnl || 0) > 0).length;
+        const recentWinRate = recentTrades.length > 0 ? (recentWins / recentTrades.length * 100).toFixed(0) : '0';
+        const recentPnl = recentTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+        const recentPnlSign = recentPnl >= 0 ? '+' : '';
+
+        console.log('\n═══════════════════════════════════════════════════════════════');
+        console.log(`📊 SUMMARY: Open: ${openCount} | Trades: ${totalTrades} (${totalWins}W/${totalLosses}L) | Win: ${winRate}%`);
+        console.log(`           PnL: ${pnlColor} ${pnlSign}$${totalPnl.toFixed(2)} | Streak: ${currentStreakType} (${currentStreak})`);
+        console.log(`           Recent (10): ${recentWinRate}% | ${recentPnlSign}$${recentPnl.toFixed(2)}`);
+        console.log('═══════════════════════════════════════════════════════════════\n');
       }
 
       // Regime distribution + filter diagnostic every 10 cycles
