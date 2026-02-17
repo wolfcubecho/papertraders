@@ -2376,7 +2376,14 @@ function writeLiveSummary(
         const pnlPercent = trade.entryPrice > 0 ? (priceDiff / trade.entryPrice) * 100 : 0;
         const pnlSign = unrealizedPnl >= 0 ? '+' : '';
         const pricePrecision = getDecimalPlaces(trade.entryPrice);
-        console.log(`   ${symbol}: ${trade.direction} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(2)}%) | SL:$${trade.stopLoss.toFixed(pricePrecision)}`);
+
+        // TP hit indicators
+        const tp1 = trade.tp1Hit ? '✓' : ' ';
+        const tp2 = trade.tp2Hit ? '✓' : ' ';
+        const tp3 = trade.tp3Hit ? '✓' : ' ';
+
+        console.log(`   ${symbol}: ${trade.direction} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(2)}%)`);
+        console.log(`       TP: [${tp1}]$${trade.takeProfit1.toFixed(pricePrecision)} [${tp2}]$${trade.takeProfit2.toFixed(pricePrecision)} [${tp3}]$${trade.takeProfit3.toFixed(pricePrecision)} | SL:$${trade.stopLoss.toFixed(pricePrecision)}`);
       }
     }
 
@@ -2421,17 +2428,24 @@ function writeLiveSummary(
       }
     }
 
-    // Calculate recent performance (last 10 trades)
-    const recentTrades = allTrades.slice(-10);
-    const recentWins = recentTrades.filter(t => (t.pnl || 0) > 0).length;
-    const recentWinRate = recentTrades.length > 0 ? (recentWins / recentTrades.length * 100).toFixed(0) : '0';
-    const recentPnl = recentTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
-    const recentPnlSign = recentPnl >= 0 ? '+' : '';
+    // Calculate unrealized P&L from open trades
+    let unrealizedPnl = 0;
+    for (const { price, trader } of results) {
+      if (trader.state.openTrade) {
+        const trade = trader.state.openTrade;
+        const isLong = trade.direction === 'LONG';
+        const currentPrice = price > 0 ? price : trade.entryPrice;
+        const priceDiff = isLong ? currentPrice - trade.entryPrice : trade.entryPrice - currentPrice;
+        unrealizedPnl += priceDiff * (trade.currentPositionSize || 1);
+      }
+    }
+    const unrealizedSign = unrealizedPnl >= 0 ? '+' : '';
+    const unrealizedColor = unrealizedPnl >= 0 ? '🟢' : '🔴';
 
     console.log('\n═══════════════════════════════════════════════════════════════');
     console.log(`📊 SUMMARY: Open: ${openCount} | Trades: ${totalTrades} (${totalWins}W/${totalLosses}L) | Win: ${winRate}%`);
-    console.log(`           PnL: ${pnlColor} ${pnlSign}$${totalPnl.toFixed(2)} | Streak: ${currentStreakType} (${currentStreak})`);
-    console.log(`           Recent (10): ${recentWinRate}% | ${recentPnlSign}$${recentPnl.toFixed(2)}`);
+    console.log(`           PnL: ${pnlColor} ${pnlSign}$${totalPnl.toFixed(2)} | Unrealized: ${unrealizedColor} ${unrealizedSign}$${unrealizedPnl.toFixed(2)}`);
+    console.log(`           Streak: ${currentStreakType} (${currentStreak})`);
     console.log('═══════════════════════════════════════════════════════════════\n');
 
     // ═══════════════════════════════════════════════════════════════
