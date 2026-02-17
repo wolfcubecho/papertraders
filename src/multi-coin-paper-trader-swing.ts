@@ -1365,6 +1365,16 @@ class CoinTrader {
       console.log(`  ${this.state.symbol}: State backed up to ${path.basename(backupFile)}`);
     }
 
+    // Initialize new timeframes Map with all intervals
+    const newTimeframes = new Map();
+    for (const interval of CONFIG.intervals) {
+      newTimeframes.set(interval, {
+        candles: [],
+        momentum: analyzeMomentum([]),
+        lastUpdate: 0,
+      });
+    }
+
     // Reset to initial state (preserve virtualBalancePerCoin from CONFIG)
     const initialBalance = CONFIG.virtualBalancePerCoin;
     this.state = {
@@ -1379,7 +1389,7 @@ class CoinTrader {
         totalPnl: 0,
         winRate: 0,
       },
-      timeframes: new Map(),
+      timeframes: newTimeframes,
       lastCheckTime: 0,
       performance: {
         byRegime: {},
