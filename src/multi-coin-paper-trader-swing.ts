@@ -1356,6 +1356,45 @@ class CoinTrader {
     fs.writeFileSync(tradesFile, JSON.stringify(this.state, null, 2));
   }
 
+  resetState(): void {
+    // Backup current state before reset
+    const tradesFile = path.join(CONFIG.tradesDir, `${this.state.symbol}.json`);
+    if (fs.existsSync(tradesFile)) {
+      const backupFile = tradesFile.replace('.json', '-backup.json');
+      fs.copyFileSync(tradesFile, backupFile);
+      console.log(`  ${this.state.symbol}: State backed up to ${path.basename(backupFile)}`);
+    }
+
+    // Reset to initial state (preserve virtualBalancePerCoin from CONFIG)
+    const initialBalance = CONFIG.virtualBalancePerCoin;
+    this.state = {
+      symbol: this.state.symbol,
+      balance: initialBalance,
+      openTrade: null,
+      trades: [],
+      stats: {
+        totalTrades: 0,
+        wins: 0,
+        losses: 0,
+        totalPnl: 0,
+        winRate: 0,
+      },
+      timeframes: new Map(),
+      lastCheckTime: 0,
+      performance: {
+        byRegime: {},
+        bySession: {},
+        byDayOfWeek: {},
+        recentEdge: 0,
+        historicalEdge: 0,
+        edgeDecay: false,
+      },
+      lastCandleCloseTime: 0,
+    };
+    this.saveState();
+    console.log(`  ${this.state.symbol}: State reset to $${initialBalance} balance`);
+  }
+
   async initialize(client: any, modelWeights: any): Promise<void> {
     this.useLightGBM = this.lgbmPredictor.load();
 

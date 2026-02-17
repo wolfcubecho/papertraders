@@ -1109,6 +1109,8 @@ interface CoinTradingState {
     totalPnl: number;
     winRate: number;
   };
+  orderBookDepth: OrderBookDepth | null;
+  lastOFIUpdate: number;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1139,6 +1141,8 @@ class CoinTrader {
         totalPnl: 0,
         winRate: 0,
       },
+      orderBookDepth: null,
+      lastOFIUpdate: 0,
     };
 
     // Initialize timeframes
@@ -1189,6 +1193,36 @@ class CoinTrader {
     } catch (e) {
       console.error(`  ${this.state.symbol}: Failed to save state:`, e);
     }
+  }
+
+  resetState(): void {
+    // Backup current state before reset
+    if (fs.existsSync(this.stateFile)) {
+      const backupFile = this.stateFile.replace('.json', '-backup.json');
+      fs.copyFileSync(this.stateFile, backupFile);
+      console.log(`  ${this.state.symbol}: State backed up to ${path.basename(backupFile)}`);
+    }
+
+    // Reset to initial state
+    this.state = {
+      symbol: this.state.symbol,
+      balance: CONFIG.virtualBalancePerCoin,
+      openTrade: null,
+      trades: [],
+      cooldownUntil: 0,
+      stats: {
+        totalTrades: 0,
+        wins: 0,
+        losses: 0,
+        totalPnl: 0,
+        winRate: 0,
+      },
+      timeframes: new Map(),
+      orderBookDepth: null,
+      lastOFIUpdate: 0,
+    };
+    this.saveState();
+    console.log(`  ${this.state.symbol}: State reset to $${CONFIG.virtualBalancePerCoin} balance`);
   }
 
   async initialize(client: any): Promise<void> {
