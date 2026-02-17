@@ -138,15 +138,15 @@ const CONFIG = {
   minWinProbability: 0,           // Disabled - ML model AUC 0.49 is worse than random! Collecting data first.
 
   // ═══════════════════════════════════════════════════════════════
-  // ENTRY/EXIT - AGGRESSIVE MODE for data collection
+  // ENTRY/EXIT - ATR-BASED STOPS for adaptive risk management
   // ═══════════════════════════════════════════════════════════════
   targets: {
-    stopLossPct: 0.25,             // 0.25% stop (tight)
-    tp1Pct: 0.50,                  // TP1: 2R (0.25% * 2) - REAL profit for scalping
-    tp2Pct: 1.00,                  // TP2: 4R (0.25% * 4) - strong profit
-    tp3Pct: 1.50,                  // TP3: 6R (0.25% * 6) - home run
-    trailingActivatePct: 0.25,    // Activate trailing after TP1
-    trailingDistancePct: 0.15,    // Trail by 0.15% (tight trail for scalp)
+    stopLossPct: 0.50,             // Fallback SL % (primary uses ATR 1.5x)
+    tp1Multiple: 2.0,              // TP1: 2R from SL (dynamic based on ATR)
+    tp2Multiple: 3.5,              // TP2: 3.5R from SL
+    tp3Multiple: 5.0,              // TP3: 5R from SL
+    trailingActivatePct: 0.50,    // Activate trailing after TP1 (0.5% profit)
+    trailingDistancePct: 0.20,    // Trail by 0.20% (give room to breathe)
     tp1ClosePct: 0.50,             // Close 50% at TP1 (lock profit early)
     tp2ClosePct: 0.25,             // Close 25% at TP2
     tp3ClosePct: 0.25,             // Close 25% at TP3
@@ -1734,15 +1734,26 @@ class CoinTrader {
     const momentum15m = tf15m?.momentum;
 
     // ═══════════════════════════════════════════════════════════════
-    // STRUCTURE-BASED STOPS: Use 15m swing points for real structure,
-    // fallback to 5m, then fixed %. 5m lookback=5 only sees ~50min
-    // micro-swings which miss real levels like round numbers.
+    // ATR-BASED STOPS: Adaptive to volatility, with structure fallback
+    // ATR automatically adjusts per coin and market conditions
     // ═══════════════════════════════════════════════════════════════
-    // Default to fixed % stop (most reliable for 5m scalping)
-    let stopDistance = currentPrice * (CONFIG.targets.stopLossPct / 100);
+    const atr5m = momentum5m?.atr || 0;
+    const atrPercent = momentum5m?.atrPercent || 0;
+
+    // Primary: ATR-based stop (1.5x ATR gives room for noise)
+    // Example: If ATR is 0.4%, SL = 0.6% (adapts to volatility)
+    let stopDistance = atr5m * 1.5;
     let stopLoss = isLong ? currentPrice - stopDistance : currentPrice + stopDistance;
 
-    // Prefer 15m swing points (captures ~2.5hr structure per side)
+    // Safety: Cap ATR stop at max 1.5% (prevent huge stops in extreme volatility)
+    const maxStopPct = 1.5;
+    const stopPct = (stopDistance / currentPrice) * 100;
+    if (stopPct > maxStopPct) {
+      stopDistance = currentPrice * (maxStopPct / 100);
+      stopLoss = isLong ? currentPrice - stopDistance : currentPrice + stopDistance;
+    }
+
+    // Fallback: Use structure-based stop if available and reasonable
     const swingHigh = (momentum15m?.swingHigh && momentum15m.swingHigh > currentPrice)
       ? momentum15m.swingHigh
       : (momentum5m?.swingHigh && momentum5m.swingHigh > currentPrice)
@@ -1758,25 +1769,32 @@ class CoinTrader {
     // Try structure-based stop if swing point available
     let structureStopDistance: number | undefined;
     if (isLong && swingLow) {
-      // LONG: Stop below recent swing low (with larger buffer for 5m volatility)
-      const structureStop = swingLow * 0.997;  // Increased from 0.999 to 0.997 (0.3% buffer)
+      // LONG: Stop below recent swing low (0.3% buffer for 5m volatility)
+      const structureStop = swingLow * 0.997;
       structureStopDistance = currentPrice - structureStop;
     } else if (!isLong && swingHigh) {
-      // SHORT: Stop above recent swing high (with larger buffer for 5m volatility)
-      const structureStop = swingHigh * 1.003;  // Increased from 1.001 to 1.003 (0.3% buffer)
+      // SHORT: Stop above recent swing high (0.3% buffer)
+      const structureStop = swingHigh * 1.003;
       structureStopDistance = structureStop - currentPrice;
     }
 
-    // Check if structure stop is reasonable distance (0.2% to 2.0%)
-    if (structureStopDistance !== undefined) {
+    // Use structure stop if it's tighter than ATR stop (more conservative)
+    if (structureStopDistance !== undefined && structureStopDistance < stopDistance) {
       const riskPct = (structureStopDistance / currentPrice) * 100;
       if (riskPct >= 0.2 && riskPct <= 2.0) {
-        // Use structure stop - it's within acceptable range
+        // Structure stop is tighter and reasonable - use it
         stopDistance = structureStopDistance;
         stopLoss = isLong ? currentPrice - stopDistance : currentPrice + stopDistance;
       }
-      // Else: stick with fixed % stop (already set as default)
     }
+
+    // Log stop type for debugging
+    const finalStopPct = (stopDistance / currentPrice) * 100;
+    const stopType = (structureStopDistance !== undefined && structureStopDistance < (atr5m * 1.5))
+      ? 'STRUCTURE'
+      : `ATR ${atrPercent.toFixed(2)}%`;
+    console.log(`   ${this.state.symbol}: SL = ${finalStopPct.toFixed(2)}% (${stopType})`);
+
 
     // ═══════════════════════════════════════════════════════════════
     // STRUCTURE-AWARE TPs: Snap to nearby structural levels/round numbers
@@ -1806,19 +1824,19 @@ class CoinTrader {
       }
     };
 
-    // R:R based targets (floor)
-    const bbMiddle = momentum5m?.bbMiddle || currentPrice;
-    const tpDistance = Math.abs(bbMiddle - currentPrice);
-    const minTpDistance = stopDistance * 2.0;
-    const actualTpDistance = Math.max(tpDistance, minTpDistance);
+    // R:R based targets (using ATR-based stop distance)
+    // TP levels are now dynamic based on actual SL distance
+    const tp1TargetDistance = stopDistance * CONFIG.targets.tp1Multiple;   // 2R
+    const tp2TargetDistance = stopDistance * CONFIG.targets.tp2Multiple;   // 3.5R
+    const tp3TargetDistance = stopDistance * CONFIG.targets.tp3Multiple;   // 5R
 
-    let rawTp1 = isLong ? currentPrice + stopDistance * 1.0 : currentPrice - stopDistance * 1.0;
-    const rawTp2 = isLong ? currentPrice + actualTpDistance * 0.75 : currentPrice - actualTpDistance * 0.75;
-    const rawTp3 = isLong ? currentPrice + actualTpDistance : currentPrice - actualTpDistance;
+    let rawTp1 = isLong ? currentPrice + tp1TargetDistance : currentPrice - tp1TargetDistance;
+    const rawTp2 = isLong ? currentPrice + tp2TargetDistance : currentPrice - tp2TargetDistance;
+    const rawTp3 = isLong ? currentPrice + tp3TargetDistance : currentPrice - tp3TargetDistance;
 
     // Try to snap TP1 to a structural level or round number
-    // Look for a target that's within 30% of the R:R TP1 and at least 0.5R from entry
-    const minTp1Distance = stopDistance * 0.5;  // Floor: at least 0.5R
+    // Look for a target that's within 30% of the R:R TP1 and at least 1R from entry
+    const minTp1Distance = stopDistance * 1.0;  // Floor: at least 1R
     const snapRange = stopDistance * 0.5;       // How far from R:R TP to look
 
     const roundTarget = findNearestRound(rawTp1, isLong ? 'above' : 'below');
