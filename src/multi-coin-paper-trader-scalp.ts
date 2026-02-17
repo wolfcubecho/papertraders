@@ -142,12 +142,12 @@ const CONFIG = {
   // ═══════════════════════════════════════════════════════════════
   targets: {
     stopLossPct: 0.25,             // 0.25% stop (tight)
-    tp1Pct: 0.1875,               // TP1: 0.75R (0.25% * 0.75) - quick win
-    tp2Pct: 0.30,                  // TP2: 1.2R (0.25% * 1.2) - second partial
-    tp3Pct: 0.45,                  // TP3: 1.8R (0.25% * 1.8) - runner
-    trailingActivatePct: 0.25,    // Activate trailing after TP1 (not at 0.5R)
-    trailingDistancePct: 0.20,    // Trail by 0.20% (give room to breathe)
-    tp1ClosePct: 0.50,             // Close 50% at TP1 (lock more profit early)
+    tp1Pct: 0.50,                  // TP1: 2R (0.25% * 2) - REAL profit for scalping
+    tp2Pct: 1.00,                  // TP2: 4R (0.25% * 4) - strong profit
+    tp3Pct: 1.50,                  // TP3: 6R (0.25% * 6) - home run
+    trailingActivatePct: 0.25,    // Activate trailing after TP1
+    trailingDistancePct: 0.15,    // Trail by 0.15% (tight trail for scalp)
+    tp1ClosePct: 0.50,             // Close 50% at TP1 (lock profit early)
     tp2ClosePct: 0.25,             // Close 25% at TP2
     tp3ClosePct: 0.25,             // Close 25% at TP3
   },
