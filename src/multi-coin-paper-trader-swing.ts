@@ -2594,7 +2594,8 @@ class MultiCoinOrchestrator {
           const tp2 = trade.tp2Hit ? '✓' : ' ';
           const tp3 = trade.tp3Hit ? '✓' : ' ';
 
-          console.log(`   ${symbol}: ${trade.direction} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(1)}%)`);
+          const currentPriceDisplay = price > 0 ? `$${price.toFixed(pricePrecision)}` : '$---';
+          console.log(`   ${symbol}: ${trade.direction} | Entry:$${trade.entryPrice.toFixed(pricePrecision)} | Now:${currentPriceDisplay} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(1)}%)`);
           console.log(`       TP: [${tp1}]$${trade.takeProfit1.toFixed(pricePrecision)} [${tp2}]$${trade.takeProfit2.toFixed(pricePrecision)} [${tp3}]$${trade.takeProfit3.toFixed(pricePrecision)} | SL:$${trade.stopLoss.toFixed(pricePrecision)}`);
         }
       }
