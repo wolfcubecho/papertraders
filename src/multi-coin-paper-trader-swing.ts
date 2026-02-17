@@ -2478,6 +2478,12 @@ class MultiCoinOrchestrator {
     console.log(`  Max Hold:        ${CONFIG.maxHoldHours}h`);
     console.log('');
 
+    // Check for --reset flag
+    const shouldReset = process.argv.includes('--reset');
+    if (shouldReset) {
+      console.log('🔄 RESET MODE: Backing up and resetting all trader states...\n');
+    }
+
     const weightsFile = path.join(process.cwd(), 'data', 'models', 'model-weights.json');
     if (fs.existsSync(weightsFile)) {
       this.modelWeights = JSON.parse(fs.readFileSync(weightsFile, 'utf-8'));
@@ -2491,6 +2497,9 @@ class MultiCoinOrchestrator {
       const trader = new CoinTrader(symbol);
       trader.loadState(new Map());
       await trader.initialize(this.client, this.modelWeights);
+      if (shouldReset) {
+        trader.resetState();
+      }
       this.traders.set(symbol, trader);
     }
 

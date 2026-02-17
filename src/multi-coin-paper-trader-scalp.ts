@@ -2194,6 +2194,12 @@ async function main() {
   console.log(`Symbols: ${SYMBOLS.length}`);
   console.log('═══════════════════════════════════════════════════════════════\n');
 
+  // Check for --reset flag
+  const shouldReset = process.argv.includes('--reset');
+  if (shouldReset) {
+    console.log('🔄 RESET MODE: Backing up and resetting all trader states...\n');
+  }
+
   const client = Binance();
 
   // Initialize traders
@@ -2201,6 +2207,9 @@ async function main() {
   for (const symbol of SYMBOLS) {
     const trader = new CoinTrader(symbol);
     await trader.initialize(client);
+    if (shouldReset) {
+      trader.resetState();
+    }
     traders.push(trader);
   }
 
