@@ -93,8 +93,13 @@ const CONFIG = {
     // Candle momentum
     minBodyRatio: 0.6,             // Body must be > 60% of candle range
 
-    // Confluence required
-    minSignals: 1,                 // Need at least 1 momentum signal (lowered for more entries)
+    // Confluence required (increased for quality entries)
+    minSignals: 2,                 // Need at least 2 momentum signals (was 1 - improve entry quality)
+
+    // Pullback entry thresholds (NEW - enter on pullbacks, not breakouts)
+    pullbackToEmaPct: 0.002,        // Enter when price within 0.2% of EMA (pullback zone)
+    pullbackToVwapPct: 0.002,      // Enter when price within 0.2% of VWAP (pullback zone)
+    maxDistanceFromEma: 0.01,      // Skip if price > 1% from EMA (chasing, too late)
 
     // MACD settings
     macdFast: 12,
@@ -107,12 +112,16 @@ const CONFIG = {
   // ═══════════════════════════════════════════════════════════════
   regime: {
     // Volatility threshold to switch modes (ATR % of price)
-    volatilityThreshold: 0.008,    // 0.8% = TREND mode (lowered for more TREND entries on 5m)
+    volatilityThreshold: 0.008,    // 0.8% = TREND mode
     minVolatility: 0.002,          // 0.2% = minimum to trade at all. Below = CHOP, skip entirely.
     atrPeriod: 14,
 
-    // TREND mode: ride momentum breakouts
-    // RANGE mode: mean reversion at BB extremes only
+    // BB mean reversion thresholds (tightened for RANGE mode)
+    rangeLongThreshold: 0.25,      // BB < 25% for LONG entries (was 30%)
+    rangeShortThreshold: 0.75,     // BB > 75% for SHORT entries (was 70%)
+
+    // TREND mode: pullback entries to EMA/VWAP (NOT breakouts)
+    // RANGE mode: mean reversion at tighter BB extremes
     // CHOP mode (< minVolatility): do NOT trade - no edge in dead markets
   },
 
@@ -146,7 +155,7 @@ const CONFIG = {
   // ═══════════════════════════════════════════════════════════════
   // TIMING
   // ═══════════════════════════════════════════════════════════════
-  maxHoldMinutes: 30,              // Max hold 30 mins (it's a scalp!)
+  maxHoldMinutes: 90,              // Max hold 90 mins - let winners run (timeout has 50% win rate!)
   cooldownMs: 60_000,              // 1 minute cooldown between trades
   onlyEnterOnCandleClose: false,   // Scalper can enter mid-candle
 
@@ -1409,57 +1418,104 @@ class CoinTrader {
 
     if (regime === 'TREND') {
       // ═══════════════════════════════════════════════════════════════
-      // TREND MODE: High volatility - ride breakouts
-      // Entry: (EMA alignment OR breakout) required
-      // MACD and VWAP are signal boosts, not hard gates
+      // TREND MODE: Pullback entries to EMA/VWAP (NOT breakouts!)
+      // Entry: Price must pull back near EMA9/VWAP, THEN confirm with other signals
+      // This reduces SL hits by entering at better prices
       // ═══════════════════════════════════════════════════════════════
       signals.push(`ATR:${(m5.atrPercent * 100).toFixed(2)}%`);
 
-      const hasMacdConfirm = direction === 'LONG'
-        ? (m5.macdBullishCross || m5.macdHistogram > 0)
-        : (m5.macdBearishCross || m5.macdHistogram < 0);
+      const isLong = direction === 'LONG';
+      const currentPrice = tf5m.candles[tf5m.candles.length - 1].close;
 
-      const hasEmaAlign = direction === 'LONG'
+      // 1. Check EMA alignment (trend definition)
+      const hasEmaAlign = isLong
         ? m5.emaAligned === 'bullish'
         : m5.emaAligned === 'bearish';
 
-      const hasBreakout = direction === 'LONG'
-        ? (m5.priceBreakoutUp || m5.bbBreakoutUp)
-        : (m5.priceBreakoutDown || m5.bbBreakoutDown);
-
-      const hasVwapConfirm = direction === 'LONG' ? m5.priceAboveVwap : !m5.priceAboveVwap;
-
-      // Only hard requirement: EMA alignment or breakout
-      if (!hasEmaAlign && !hasBreakout) {
+      if (!hasEmaAlign) {
         return {
           shouldEnter: false,
           direction,
           strength,
           signals,
-          reason: `TREND: Need EMA align or breakout`,
+          reason: `TREND: No EMA alignment (${m5.emaAligned})`,
           mlPrediction: 0.5,
         };
       }
 
-      // MACD and VWAP are boosts, not gates
-      if (hasMacdConfirm) signals.push('MACD✓');
-      if (hasVwapConfirm) signals.push('VWAP✓');
+      // 2. Check if price is in pullback zone (near EMA or VWAP)
+      const emaDistance = Math.abs((currentPrice - m5.emaFast) / currentPrice);
+      const vwapDistance = Math.abs(m5.vwapDeviation);
+      const nearEma = emaDistance <= CONFIG.momentum.pullbackToEmaPct;
+      const nearVwap = vwapDistance <= CONFIG.momentum.pullbackToVwapPct;
+      const tooFarFromEma = emaDistance > CONFIG.momentum.maxDistanceFromEma;
 
-      // Extra confidence with volume
-      if (m5.volumeSpike) signals.push('VOL✓');
-      if (m5.macdBullishCross) signals.push('MACD↑');
-      if (m5.macdBearishCross) signals.push('MACD↓');
+      if (tooFarFromEma) {
+        return {
+          shouldEnter: false,
+          direction,
+          strength,
+          signals,
+          reason: `TREND: Price too far from EMA (${(emaDistance * 100).toFixed(2)}% > ${(CONFIG.momentum.maxDistanceFromEma * 100).toFixed(1)}%)`,
+          mlPrediction: 0.5,
+        };
+      }
 
-      // Kill zone bonus (prefer but don't require)
-      const kzBonus = m5.isKillZone ? '+KZ' : '';
+      if (!nearEma && !nearVwap) {
+        return {
+          shouldEnter: false,
+          direction,
+          strength,
+          signals,
+          reason: `TREND: Price not in pullback zone (EMA:${(emaDistance * 100).toFixed(2)}%, VWAP:${(vwapDistance * 100).toFixed(2)}%)`,
+          mlPrediction: 0.5,
+        };
+      }
+
+      if (nearEma) signals.push('EMA✓');
+      if (nearVwap) signals.push('VWAP✓');
+
+      // 3. MACD confirmation (must align with direction)
+      const hasMacdConfirm = isLong
+        ? (m5.macdBullishCross || m5.macdHistogram > 0)
+        : (m5.macdBearishCross || m5.macdHistogram < 0);
+
+      if (!hasMacdConfirm) {
+        return {
+          shouldEnter: false,
+          direction,
+          strength,
+          signals,
+          reason: `TREND: Need MACD confirmation (histogram:${m5.macdHistogram.toFixed(4)})`,
+          mlPrediction: 0.5,
+        };
+      }
+      signals.push('MACD✓');
+
+      // 4. Volume spike REQUIRED (only profitable filter from data)
+      if (!m5.volumeSpike) {
+        return {
+          shouldEnter: false,
+          direction,
+          strength,
+          signals,
+          reason: `TREND: Need volume spike (current:${m5.volumeRatio.toFixed(1)}x)`,
+          mlPrediction: 0.5,
+        };
+      }
+      signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x`);
+
+      // 5. Williams %R confirmation (additional edge)
+      const williamsConfirm = isLong
+        ? (m5.williamsROversold || m5.williamsR < -80)
+        : (m5.williamsROverbought || m5.williamsR > -20);
+      if (williamsConfirm) signals.push('W%R✓');
 
       // ═══════════════════════════════════════════════════════════════
-      // R:R FILTER: Stop distance must be <= 2x TP1 distance
+      // R:R FILTER: Stop distance check
       // ═══════════════════════════════════════════════════════════════
-      const currentPrice = tf5m.candles[tf5m.candles.length - 1].close;
       const tf15m = this.state.timeframes.get('15m');
       const m15 = tf15m?.momentum;
-      const isLong = direction === 'LONG';
 
       // Calculate stop distance (same logic as enterTrade)
       const swingHigh = (m15?.swingHigh && m15.swingHigh > currentPrice)
@@ -1478,38 +1534,26 @@ class CoinTrader {
         estimatedStopDistance = currentPrice * (CONFIG.targets.stopLossPct / 100);
       }
 
-      // R:R filter: stop must be <= 2x TP1 (TP1 = 0.75R for aggressive mode)
-      const tp1Distance = estimatedStopDistance * 0.75;  // TP1 is 0.75R
-      if (estimatedStopDistance > tp1Distance * 2.67) {  // stop > 2x TP1 (2x * 0.75R = 1.5R, 1/0.75 = 1.33, wait... let me recalculate)
-        // Actually: if stop is 2x TP1, then TP1 = stop / 2 = 0.5R
-        // Our TP1 is 0.75R, so stop should be <= TP1 * 2 = stop * 0.75 * 2 = stop * 1.5
-        // That's always true... let me think again.
-        // R:R ratio = TP1 / stop = 0.75R / 1R = 0.75
-        // We want R:R >= 0.5 (stop <= 2x TP1), which is always true since TP1 = 0.75R
-        // The filter should be: stop / TP1 <= 2, i.e., 1R / 0.75R <= 2 = 1.33 <= 2, always true
-        // Actually, the filter is meant to catch cases where structure stop is too far
-        // Let's just check: stop distance as % of price
-        const stopPct = (estimatedStopDistance / currentPrice) * 100;
-        if (stopPct > 0.5) {  // If stop is > 0.5% (2x our 0.25% base stop), reject
-          return {
-            shouldEnter: false,
-            direction,
-            strength,
-            signals,
-            reason: `R:R Filter: Stop too far (${stopPct.toFixed(2)}% > 0.5%)`,
-            mlPrediction: 0.5,
-          };
-        }
+      // R:R filter: stop distance as % of price
+      const stopPct = (estimatedStopDistance / currentPrice) * 100;
+      if (stopPct > 0.5) {  // If stop is > 0.5% (2x our 0.25% base stop), reject
+        return {
+          shouldEnter: false,
+          direction,
+          strength,
+          signals,
+          reason: `R:R Filter: Stop too far (${stopPct.toFixed(2)}% > 0.5%)`,
+          mlPrediction: 0.5,
+        };
       }
 
       // ML prediction (optional)
       let mlPrediction = 0.5;
       if (this.useLightGBM) {
         try {
-          // Create a minimal feature set from momentum for ML prediction
           const features: Record<string, any> = {
             bb_position: m5.bbPosition,
-            bb_width: m5.bbUpper && m5.bbUpper > m5.bbLower ? ((m5.bbUpper - m5.bbLower) / tf5m.candles[tf5m.candles.length - 1].close) * 100 : 0,
+            bb_width: m5.bbUpper && m5.bbUpper > m5.bbLower ? ((m5.bbUpper - m5.bbLower) / currentPrice) * 100 : 0,
             rsi_value: m5.rsiValue,
             ema_fast: m5.emaFast,
             ema_slow: m5.emaSlow,
@@ -1552,28 +1596,29 @@ class CoinTrader {
         signals.push(`ML:${(mlPrediction * 100).toFixed(0)}%`);
       }
 
+      // NO kill zone bonus - data shows KZ hurts performance (7.9% vs 16.9% win rate)
       return {
         shouldEnter: true,
         direction,
-        strength: m5.isKillZone ? Math.min(1, strength + 0.1) : strength,
+        strength: Math.min(1, strength + (nearEma ? 0.1 : 0) + (nearVwap ? 0.1 : 0) + (williamsConfirm ? 0.1 : 0)),
         signals,
-        reason: `TREND ${direction} (MACD+${hasEmaAlign ? 'EMA' : 'BRK'}+VWAP${kzBonus})`,
+        reason: `TREND ${direction} (pullback:${nearEma ? 'EMA' : 'VWAP'}+MACD+VOL)`,
         mlPrediction,
       };
 
     } else {
       // ═══════════════════════════════════════════════════════════════
-      // RANGE MODE: Mean reversion at BB extremes
+      // RANGE MODE: Mean reversion at tighter BB extremes (25%/75%)
       // Direction is OVERRIDDEN by BB position (mean reversion logic):
-      //   BB < 30% → LONG (buy oversold), BB > 70% → SHORT (sell overbought)
-      // Middle zone (30-70%) → skip, no edge
+      //   BB < 25% → LONG (buy oversold), BB > 75% → SHORT (sell overbought)
+      // Middle zone (25-75%) → skip, no edge
       // ═══════════════════════════════════════════════════════════════
 
-      // Override direction based on BB position for mean reversion
+      // Override direction based on BB position for mean reversion (tighter thresholds)
       let rangeDirection: 'LONG' | 'SHORT' | 'SKIP' = 'SKIP';
-      if (bbPos < 0.3) {
+      if (bbPos < CONFIG.regime.rangeLongThreshold) {  // < 25%
         rangeDirection = 'LONG';
-      } else if (bbPos > 0.7) {
+      } else if (bbPos > CONFIG.regime.rangeShortThreshold) {  // > 75%
         rangeDirection = 'SHORT';
       }
 
@@ -1583,13 +1628,14 @@ class CoinTrader {
           direction,
           strength,
           signals,
-          reason: `RANGE: BB in middle zone (${(bbPos * 100).toFixed(0)}%) - need <30% or >70%`,
+          reason: `RANGE: BB in middle zone (${(bbPos * 100).toFixed(0)}%) - need <${CONFIG.regime.rangeLongThreshold * 100}% or >${CONFIG.regime.rangeShortThreshold * 100}%`,
           mlPrediction: 0.5,
         };
       }
 
       // Use mean reversion direction instead of momentum direction
       const direction_override = rangeDirection as 'LONG' | 'SHORT';
+      const isLong = direction_override === 'LONG';
 
       // Require volume spike for RANGE entries - the ONLY profitable filter from historical data
       if (!m5.volumeSpike) {
@@ -1602,108 +1648,34 @@ class CoinTrader {
           reason: `RANGE: ${direction_override} needs volume spike (BB:${(bbPos * 100).toFixed(0)}%)`
         };
       }
+      signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x`);
 
-      // VWAP deviation adds confluence (extended = better reversion opportunity)
-      const vwapExtended = Math.abs(m5.vwapDeviationStd) > 1.0;
-      const vwapCorrectSide = direction_override === 'LONG' ? m5.vwapDeviationStd < 0 : m5.vwapDeviationStd > 0;
-      const vwapBonus = vwapExtended && vwapCorrectSide;
+      // Williams %R confirmation (should be at extreme for mean reversion)
+      const williamsAtExtreme = isLong
+        ? (m5.williamsROversold || m5.williamsR < -80)
+        : (m5.williamsROverbought || m5.williamsR > -20);
+      if (williamsAtExtreme) signals.push('W%R✓');
 
-      // Kill zone timing (optional but preferred)
-      const kzBonus = m5.isKillZone ? '+KZ' : '';
+      // Price turning confirmation (candle should show reversal)
+      const candleTurning = isLong
+        ? (m5.candleMomentum === 'bullish')
+        : (m5.candleMomentum === 'bearish');
+      if (candleTurning) signals.push('CANDLE✓');
 
-      // ML prediction (optional)
-      let mlPrediction = 0.5;
-      if (this.useLightGBM) {
-        try {
-          const features: Record<string, any> = {
-            bb_position: m5.bbPosition,
-            bb_width: m5.bbUpper && m5.bbUpper > m5.bbLower ? ((m5.bbUpper - m5.bbLower) / tf5m.candles[tf5m.candles.length - 1].close) * 100 : 0,
-            rsi_value: m5.rsiValue,
-            ema_fast: m5.emaFast,
-            ema_slow: m5.emaSlow,
-            ema_aligned: m5.emaAligned,
-            macd_line: m5.macdLine,
-            macd_signal: m5.macdSignal,
-            macd_histogram: m5.macdHistogram,
-            vwap: m5.vwap,
-            vwap_deviation: m5.vwapDeviation,
-            vwap_deviation_std: m5.vwapDeviationStd,
-            price_above_vwap: m5.priceAboveVwap,
-            atr_percent: m5.atrPercent,
-            volatility: m5.atrPercent,
-            volume_ratio: m5.volumeRatio,
-            volume_spike: m5.volumeSpike ? 1 : 0,
-            direction: direction_override === 'LONG' ? 'long' : 'short',
-            regime: m5.regime,
-          };
+      // NO kill zone bonus - data shows KZ hurts performance
+      // NO ML prediction for RANGE mode - let price action dictate
 
-          const prediction = this.lgbmPredictor.predict(features as TradeFeatures);
-          mlPrediction = prediction.winProbability;
-        } catch {
-          // ML prediction failed, proceed with default 0.5
-        }
-      }
+      // Calculate final strength (bonus for confirmations)
+      const rangeStrength = Math.min(1, strength + (williamsAtExtreme ? 0.15 : 0) + (candleTurning ? 0.1 : 0));
 
-      // ML filter (bypass if threshold = 0)
-      if (CONFIG.minWinProbability > 0 && mlPrediction < CONFIG.minWinProbability) {
-        return {
-          shouldEnter: false,
-          direction: direction_override,
-          strength,
-          signals,
-          mlPrediction,
-          reason: `ML reject: ${(mlPrediction * 100).toFixed(0)}% < ${(CONFIG.minWinProbability * 100).toFixed(0)}%`
-        };
-      }
-
-      if (CONFIG.minWinProbability > 0) {
-        signals.push(`ML:${(mlPrediction * 100).toFixed(0)}%`);
-      }
-
-      // ═══════════════════════════════════════════════════════════════
-      // R:R FILTER: Stop distance must be reasonable
-      // ═══════════════════════════════════════════════════════════════
-      const currentPrice = tf5m.candles[tf5m.candles.length - 1].close;
-      const tf15m = this.state.timeframes.get('15m');
-      const m15 = tf15m?.momentum;
-
-      const swingHigh = (m15?.swingHigh && m15.swingHigh > currentPrice)
-        ? m15.swingHigh
-        : (m5.swingHigh && m5.swingHigh > currentPrice) ? m5.swingHigh : null;
-      const swingLow = (m15?.swingLow && m15.swingLow < currentPrice)
-        ? m15.swingLow
-        : (m5.swingLow && m5.swingLow < currentPrice) ? m5.swingLow : null;
-
-      let estimatedStopDistance: number;
-      if (direction_override === 'LONG' && swingLow) {
-        estimatedStopDistance = currentPrice - (swingLow * 0.999);
-      } else if (direction_override === 'SHORT' && swingHigh) {
-        estimatedStopDistance = (swingHigh * 1.002) - currentPrice;
-      } else {
-        estimatedStopDistance = currentPrice * (CONFIG.targets.stopLossPct / 100);
-      }
-
-      const stopPct = (estimatedStopDistance / currentPrice) * 100;
-      if (stopPct > 0.5) {
-        return {
-          shouldEnter: false,
-          direction: direction_override,
-          strength,
-          signals,
-          mlPrediction: 0.5,
-          reason: `R:R Filter: Stop too far (${stopPct.toFixed(2)}% > 0.5%)`
-        };
-      }
-
-      // Passed RANGE filters - take the trade with mean reversion direction!
-      const bbZone = bbPos < 0.3 ? 'lower' : 'upper';
+      const bbZone = bbPos < CONFIG.regime.rangeLongThreshold ? 'lower' : 'upper';
       return {
         shouldEnter: true,
         direction: direction_override,
-        strength: (vwapBonus || m5.isKillZone) ? Math.min(1, strength + 0.1) : strength,
+        strength: rangeStrength,
         signals,
-        reason: `RANGE ${direction_override} @ BB ${bbZone}${vwapBonus ? '+VWAP' : ''}${kzBonus}`,
-        mlPrediction,
+        reason: `RANGE ${direction_override} @ BB ${bbZone}+VOL${williamsAtExtreme ? '+W%R' : ''}${candleTurning ? '+CANDLE' : ''}`,
+        mlPrediction: 0.5,
       };
     }
   }
