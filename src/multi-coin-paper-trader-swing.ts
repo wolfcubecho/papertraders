@@ -92,11 +92,11 @@ const CONFIG = {
     emaFast: 9,
     emaSlow: 21,
 
-    // Bollinger Bands: Mean reversion extremes (25%/75% for swing)
+    // Bollinger Bands: Mean reversion extremes (20%/80% for 4H swing - wider than scalp)
     bbPeriod: 20,
     bbStdDev: 2,
-    bbExtremeLong: 0.25,   // 25% = LONG entry in RANGE mode (was 20%)
-    bbExtremeShort: 0.75,  // 75% = SHORT entry in RANGE mode (was 80%)
+    bbExtremeLong: 0.20,   // 20% = LONG entry in RANGE mode (wider for 4H swing)
+    bbExtremeShort: 0.80,  // 80% = SHORT entry in RANGE mode (wider for 4H swing)
 
     // MACD: Momentum confirmation
     macdFast: 12,
@@ -1553,10 +1553,11 @@ class CoinTrader {
       return noEntry(`CHOP: ATR ${(m4h.atrPercent * 100).toFixed(2)}% < ${(CONFIG.regime.minVolatility * 100).toFixed(1)}% - skip`, direction, 'CHOP');
     }
 
-    // TREND mode needs momentum direction; RANGE mode derives direction from BB position
-    if (regime === 'TREND' && direction === 'NEUTRAL') {
-      return noEntry(`TREND: No clear direction`, 'NEUTRAL', 'TREND');
-    }
+    // TREND mode: Allow NEUTRAL direction to pass through to entry logic
+    // Swing trades can work even without perfect 4H alignment
+    // RANGE mode derives direction from BB position (handled below)
+    signals.push(`ATR:${(m4h.atrPercent * 100).toFixed(2)}%`);
+    signals.push(`BB:${(m4h.bbPosition * 100).toFixed(0)}%`);
 
     signals.push(`ATR:${(m4h.atrPercent * 100).toFixed(2)}%`);
     signals.push(`BB:${(m4h.bbPosition * 100).toFixed(0)}%`);
@@ -1579,11 +1580,10 @@ class CoinTrader {
       }
       signals.push(hasEmaAlign ? 'EMA' : 'BRK');
 
+      // VWAP confirmation (soft - not a hard gate for swing trading)
       const hasVwapConfirm = direction === 'LONG' ? m4h.priceAboveVwap : !m4h.priceAboveVwap;
-      if (!hasVwapConfirm) {
-        return { ...noEntry(`TREND: Wrong side of VWAP`, direction, 'TREND'), signals };
-      }
-      signals.push('VWAP');
+      if (hasVwapConfirm) signals.push('VWAP✓');
+      // No rejection for wrong VWAP side - swing trades can work against VWAP
 
       // MACD filter (not gate): only block if strongly against direction (>0.5%)
       const macdAgainst = direction === 'LONG'
@@ -1729,7 +1729,8 @@ class CoinTrader {
     }
 
     const estimatedRiskPct = (estimatedStopDistance / currentPrice) * 100;
-    if (estimatedRiskPct > 10) {
+    // For swing trading, allow wider stops (up to 15% risk) - swing needs room to breathe
+    if (estimatedRiskPct > 15) {
       return { ...noEntry(`Stop too far (${estimatedRiskPct.toFixed(1)}% risk)`, direction, regime), signals, mlPrediction, qualityScore, smcContext };
     }
     if (estimatedRiskPct < 0.3) {
