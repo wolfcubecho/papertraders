@@ -1843,10 +1843,19 @@ class CoinTrader {
     const riskAmount = this.state.balance * (kellyRiskPct / 100);
     let positionSize = riskAmount / stopDistance;
 
-    // Dynamic leverage based on signal strength: 1x (weak) to 3x (strong)
-    const dynamicLeverage = 1 + Math.floor(analysis.strength * 3);  // 0-33%=1x, 34-66%=2x, 67-100%=3x
+    // Dynamic leverage based on signal strength: 1x (weak) to 4x (strong)
+    const dynamicLeverage = 1 + Math.floor(analysis.strength * 3);  // 0-33%=1x, 34-66%=2x, 67-100%=3x, 100%=4x
     const maxNotional = this.state.balance * dynamicLeverage;
     const uncappedNotional = currentPrice * positionSize;
+
+    // Debug: Log position sizing (helpful for troubleshooting leverage issues)
+    const effectiveLeverage = uncappedNotional / this.state.balance;
+    if (effectiveLeverage > 5) {
+      console.log(`  ⚠️ ${this.state.symbol}: HIGH LEVERAGE WARNING!`);
+      console.log(`     Balance: $${this.state.balance.toFixed(2)}, Strength: ${(analysis.strength * 100).toFixed(0)}%`);
+      console.log(`     Uncapped: $${uncappedNotional.toFixed(2)} (${effectiveLeverage.toFixed(1)}x), Max: $${maxNotional.toFixed(2)} (${dynamicLeverage}x)`);
+    }
+
     if (uncappedNotional > maxNotional) {
       positionSize = maxNotional / currentPrice;
       console.log(`  ${this.state.symbol}: Position capped to ${dynamicLeverage}x leverage (strength: ${(analysis.strength * 100).toFixed(0)}%)`);
