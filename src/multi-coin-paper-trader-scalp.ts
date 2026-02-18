@@ -96,10 +96,10 @@ const CONFIG = {
     // Confluence required (increased for quality entries)
     minSignals: 2,                 // Need at least 2 momentum signals (was 1 - improve entry quality)
 
-    // Pullback entry thresholds (NEW - enter on pullbacks, not breakouts)
-    pullbackToEmaPct: 0.002,        // Enter when price within 0.2% of EMA (pullback zone)
-    pullbackToVwapPct: 0.002,      // Enter when price within 0.2% of VWAP (pullback zone)
-    maxDistanceFromEma: 0.01,      // Skip if price > 1% from EMA (chasing, too late)
+    // Pullback entry thresholds (widened for more entries)
+    pullbackToEmaPct: 0.004,        // Enter when price within 0.4% of EMA (widened from 0.2%)
+    pullbackToVwapPct: 0.004,      // Enter when price within 0.4% of VWAP (widened from 0.2%)
+    maxDistanceFromEma: 0.015,     // Skip if price > 1.5% from EMA (widened from 1%)
 
     // MACD settings
     macdFast: 12,
@@ -138,24 +138,25 @@ const CONFIG = {
   minWinProbability: 0,           // Disabled - ML model AUC 0.49 is worse than random! Collecting data first.
 
   // ═══════════════════════════════════════════════════════════════
-  // ENTRY/EXIT - ATR-BASED STOPS for adaptive risk management
+  // ENTRY/EXIT - QUICK SCALP TARGETS
   // ═══════════════════════════════════════════════════════════════
   targets: {
     stopLossPct: 0.50,             // Fallback SL % (primary uses ATR 1.5x)
-    tp1Multiple: 2.0,              // TP1: 2R from SL (dynamic based on ATR)
-    tp2Multiple: 3.5,              // TP2: 3.5R from SL
-    tp3Multiple: 5.0,              // TP3: 5R from SL
-    trailingActivatePct: 0.50,    // Activate trailing after TP1 (0.5% profit)
-    trailingDistancePct: 0.20,    // Trail by 0.20% (give room to breathe)
+    // FIXED % TARGETS for true scalping - lock profits fast!
+    tp1Pct: 0.50,                  // TP1: 0.5% - quick profit, easy to hit
+    tp2Pct: 1.0,                   // TP2: 1.0% - solid scalp target
+    tp3Pct: 1.5,                   // TP3: 1.5% - home run
+    trailingActivatePct: 0.30,    // Activate trailing after 0.3% profit
+    trailingDistancePct: 0.15,    // Trail tight by 0.15%
     tp1ClosePct: 0.50,             // Close 50% at TP1 (lock profit early)
-    tp2ClosePct: 0.25,             // Close 25% at TP2
-    tp3ClosePct: 0.25,             // Close 25% at TP3
+    tp2ClosePct: 0.30,             // Close 30% at TP2
+    tp3ClosePct: 0.20,             // Close 20% at TP3
   },
 
   // ═══════════════════════════════════════════════════════════════
-  // TIMING
+  // TIMING - TRUE SCALPING
   // ═══════════════════════════════════════════════════════════════
-  maxHoldMinutes: 90,              // Max hold 90 mins - let winners run (timeout has 50% win rate!)
+  maxHoldMinutes: 30,              // Max 30 mins - true scalping, in and out!
   cooldownMs: 60_000,              // 1 minute cooldown between trades
   onlyEnterOnCandleClose: false,   // Scalper can enter mid-candle
 
@@ -1521,22 +1522,11 @@ class CoinTrader {
       if (nearEma) signals.push('EMA✓');
       if (nearVwap) signals.push('VWAP✓');
 
-      // 3. MACD confirmation (must align with direction)
+      // 3. MACD confirmation (OPTIONAL - bonus if present, not required)
       const hasMacdConfirm = isLong
         ? (m5.macdBullishCross || m5.macdHistogram > 0)
         : (m5.macdBearishCross || m5.macdHistogram < 0);
-
-      if (!hasMacdConfirm) {
-        return {
-          shouldEnter: false,
-          direction,
-          strength,
-          signals,
-          reason: `TREND: Need MACD confirmation (histogram:${m5.macdHistogram.toFixed(4)})`,
-          mlPrediction: 0.5,
-        };
-      }
-      signals.push('MACD✓');
+      if (hasMacdConfirm) signals.push('MACD✓');
 
       // 4. Volume spike REQUIRED (only profitable filter from data)
       if (!m5.volumeSpike) {
@@ -1551,44 +1541,34 @@ class CoinTrader {
       }
       signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x`);
 
-      // 5. Williams %R confirmation (additional edge)
+      // 5. Williams %R confirmation (optional bonus)
       const williamsConfirm = isLong
         ? (m5.williamsROversold || m5.williamsR < -80)
         : (m5.williamsROverbought || m5.williamsR > -20);
       if (williamsConfirm) signals.push('W%R✓');
 
       // ═══════════════════════════════════════════════════════════════
-      // R:R FILTER: Stop distance check
+      // R:R FILTER: Stop distance check (updated for ATR-based SL)
       // ═══════════════════════════════════════════════════════════════
       const tf15m = this.state.timeframes.get('15m');
       const m15 = tf15m?.momentum;
 
-      // Calculate stop distance (same logic as enterTrade)
-      const swingHigh = (m15?.swingHigh && m15.swingHigh > currentPrice)
-        ? m15.swingHigh
-        : (m5.swingHigh && m5.swingHigh > currentPrice) ? m5.swingHigh : null;
-      const swingLow = (m15?.swingLow && m15.swingLow < currentPrice)
-        ? m15.swingLow
-        : (m5.swingLow && m5.swingLow < currentPrice) ? m5.swingLow : null;
+      // Calculate stop distance (same logic as enterTrade - uses ATR)
+      const atrStopDistance = (m5.atr || currentPrice * 0.005) * 1.5;
+      const maxStopDistance = currentPrice * 0.015; // 1.5% max
 
-      let estimatedStopDistance: number;
-      if (isLong && swingLow) {
-        estimatedStopDistance = currentPrice - (swingLow * 0.999);
-      } else if (!isLong && swingHigh) {
-        estimatedStopDistance = (swingHigh * 1.002) - currentPrice;
-      } else {
-        estimatedStopDistance = currentPrice * (CONFIG.targets.stopLossPct / 100);
-      }
+      // Use ATR-based stop for R:R check
+      const estimatedStopDistance = Math.min(atrStopDistance, maxStopDistance);
 
-      // R:R filter: stop distance as % of price
+      // R:R filter: stop distance as % of price (updated for ATR-based SL)
       const stopPct = (estimatedStopDistance / currentPrice) * 100;
-      if (stopPct > 0.5) {  // If stop is > 0.5% (2x our 0.25% base stop), reject
+      if (stopPct > 1.5) {  // Max 1.5% stop (matches ATR cap)
         return {
           shouldEnter: false,
           direction,
           strength,
           signals,
-          reason: `R:R Filter: Stop too far (${stopPct.toFixed(2)}% > 0.5%)`,
+          reason: `R:R Filter: Stop too far (${stopPct.toFixed(2)}% > 1.5%)`,
           mlPrediction: 0.5,
         };
       }
@@ -1708,6 +1688,26 @@ class CoinTrader {
         : (m5.candleMomentum === 'bearish');
       if (candleTurning) signals.push('CANDLE✓');
 
+      // ═══════════════════════════════════════════════════════════════
+      // R:R FILTER for RANGE mode (same as TREND)
+      // ═══════════════════════════════════════════════════════════════
+      const currentPrice = tf5m.candles[tf5m.candles.length - 1].close;
+      const atrStopDistance = (m5.atr || currentPrice * 0.005) * 1.5;
+      const maxStopDistance = currentPrice * 0.015;
+      const estimatedStopDistance = Math.min(atrStopDistance, maxStopDistance);
+      const stopPct = (estimatedStopDistance / currentPrice) * 100;
+
+      if (stopPct > 1.5) {
+        return {
+          shouldEnter: false,
+          direction: direction_override,
+          strength,
+          signals,
+          mlPrediction: 0.5,
+          reason: `RANGE: Stop too far (${stopPct.toFixed(2)}% > 1.5%)`
+        };
+      }
+
       // NO kill zone bonus - data shows KZ hurts performance
       // NO ML prediction for RANGE mode - let price action dictate
 
@@ -1824,46 +1824,15 @@ class CoinTrader {
       }
     };
 
-    // R:R based targets (using ATR-based stop distance)
-    // TP levels are now dynamic based on actual SL distance
-    const tp1TargetDistance = stopDistance * CONFIG.targets.tp1Multiple;   // 2R
-    const tp2TargetDistance = stopDistance * CONFIG.targets.tp2Multiple;   // 3.5R
-    const tp3TargetDistance = stopDistance * CONFIG.targets.tp3Multiple;   // 5R
+    // FIXED % TARGETS for true scalping - quick in and out!
+    // TP levels are fixed percentages for consistent scalping
+    const tp1Distance = currentPrice * (CONFIG.targets.tp1Pct / 100);   // 0.5%
+    const tp2Distance = currentPrice * (CONFIG.targets.tp2Pct / 100);   // 1.0%
+    const tp3Distance = currentPrice * (CONFIG.targets.tp3Pct / 100);   // 1.5%
 
-    let rawTp1 = isLong ? currentPrice + tp1TargetDistance : currentPrice - tp1TargetDistance;
-    const rawTp2 = isLong ? currentPrice + tp2TargetDistance : currentPrice - tp2TargetDistance;
-    const rawTp3 = isLong ? currentPrice + tp3TargetDistance : currentPrice - tp3TargetDistance;
-
-    // Try to snap TP1 to a structural level or round number
-    // Look for a target that's within 30% of the R:R TP1 and at least 1R from entry
-    const minTp1Distance = stopDistance * 1.0;  // Floor: at least 1R
-    const snapRange = stopDistance * 0.5;       // How far from R:R TP to look
-
-    const roundTarget = findNearestRound(rawTp1, isLong ? 'above' : 'below');
-    const structTarget = isLong
-      ? (structuralHigh && structuralHigh > currentPrice + minTp1Distance ? structuralHigh : null)
-      : (structuralLow && structuralLow < currentPrice - minTp1Distance ? structuralLow : null);
-
-    // Pick the best structural target near our R:R TP1
-    let snappedTp1 = rawTp1;
-    const candidates: { level: number; label: string }[] = [];
-
-    if (Math.abs(roundTarget - rawTp1) <= snapRange && Math.abs(roundTarget - currentPrice) >= minTp1Distance) {
-      candidates.push({ level: roundTarget, label: 'round' });
-    }
-    if (structTarget && Math.abs(structTarget - rawTp1) <= snapRange) {
-      candidates.push({ level: structTarget, label: 'swing' });
-    }
-
-    // Pick the one closest to our R:R target (conservative snap)
-    if (candidates.length > 0) {
-      candidates.sort((a, b) => Math.abs(a.level - rawTp1) - Math.abs(b.level - rawTp1));
-      snappedTp1 = candidates[0].level;
-    }
-
-    const takeProfit1 = snappedTp1;
-    const takeProfit2 = rawTp2;
-    const takeProfit3 = rawTp3;
+    const takeProfit1 = isLong ? currentPrice + tp1Distance : currentPrice - tp1Distance;
+    const takeProfit2 = isLong ? currentPrice + tp2Distance : currentPrice - tp2Distance;
+    const takeProfit3 = isLong ? currentPrice + tp3Distance : currentPrice - tp3Distance;
 
     // ═══════════════════════════════════════════════════════════════
     // KELLY CRITERION POSITION SIZING
@@ -1871,8 +1840,8 @@ class CoinTrader {
     // ═══════════════════════════════════════════════════════════════
 
     // Calculate R:R based on actual stop and TP1 distance
-    const tp1Distance = Math.abs(takeProfit1 - currentPrice);
-    const rRatio = tp1Distance / stopDistance;  // R:R ratio
+    const tp1ActualDistance = Math.abs(takeProfit1 - currentPrice);
+    const rRatio = tp1ActualDistance / stopDistance;  // R:R ratio
 
     // Use ML prediction as win probability, fallback to conservative 0.4
     const mlWinProb = 0.4;  // Conservative fallback since we don't have ML in this context
@@ -1972,8 +1941,7 @@ class CoinTrader {
 
     console.log(`\n⚡ ${this.state.symbol}: SCALP ${trade.direction} [${swingSource}]`);
     console.log(`   Entry: $${fillPrice.toFixed(4)} | SL: $${stopLoss.toFixed(4)} (${riskPct.toFixed(2)}% risk)`);
-    const tp1Snapped = takeProfit1 !== rawTp1 ? ` [snapped from $${rawTp1.toFixed(2)}]` : '';
-    console.log(`   TP1: $${takeProfit1.toFixed(4)}${tp1Snapped} | TP2: $${takeProfit2.toFixed(4)} | TP3: $${takeProfit3.toFixed(4)}`);
+    console.log(`   TP1: $${takeProfit1.toFixed(4)} (${CONFIG.targets.tp1Pct}%) | TP2: $${takeProfit2.toFixed(4)} (${CONFIG.targets.tp2Pct}%) | TP3: $${takeProfit3.toFixed(4)} (${CONFIG.targets.tp3Pct}%)`);
     console.log(`   Signals: ${analysis.signals.join(', ')}`);
     console.log(`   Strength: ${(analysis.strength * 100).toFixed(0)}% | Size: ${positionSize.toFixed(4)}`);
   }
