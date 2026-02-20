@@ -66,19 +66,28 @@ const CONFIG = {
     summaryFile: path.join(process.cwd(), 'data', 'paper-trades-summary-swing-live.json'),  // Live summary for OpenClaw
   },
 
-  // Regime detection
+  // Regime detection: MOMENTUM / RANGE / NONE
   regime: {
-    volatilityThreshold: 0.025,  // 2.5% ATR/price = TREND mode (4H scale)
-    minVolatility: 0.008,        // 0.8% = floor. Below = CHOP, skip.
     atrPeriod: 14,
+    // ADX thresholds for regime classification
+    adxMomentumMin: 25,            // ADX > 25 = strong trend
+    adxRangeMax: 20,               // ADX < 20 = weak/range-bound
+    // BB width thresholds (as multiple of average)
+    bbExpandingMultiple: 1.2,      // BB width > 1.2x avg = expanding/volatile
+    bbNormalMaxMultiple: 1.5,      // BB width < 1.5x avg = normal (not squeeze)
+    // BB mean reversion thresholds (for RANGE mode)
+    bbExtremeLong: 0.25,           // BB < 25% for LONG entries
+    bbExtremeShort: 0.75,          // BB > 75% for SHORT entries
   },
 
   // ═══════════════════════════════════════════════════════════════
   // QUANT-LEVEL MOMENTUM THRESHOLDS
   // ═══════════════════════════════════════════════════════════════
   momentum: {
-    // Volume spike: 1.1x for 4H timeframe (QUANT-LEVEL: optimized for swing entries)
-    volumeSpikeMultiple: 1.1,
+    // Volume spike thresholds (MOMENTUM needs 2x, RANGE needs 1.5x)
+    volumeSpikeMultipleMomentum: 2.0,   // MOMENTUM mode: Volume > 2x average
+    volumeSpikeMultipleRange: 1.5,      // RANGE mode: Volume > 1.5x average
+    volumeSpikeMultiple: 1.5,           // Default (used for signal counting)
     volumeAvgPeriod: 20,
 
     // RSI: Standard settings for swing timeframe
@@ -92,11 +101,11 @@ const CONFIG = {
     emaFast: 9,
     emaSlow: 21,
 
-    // Bollinger Bands: Mean reversion extremes (20%/80% for 4H swing - wider than scalp)
+    // Bollinger Bands: Mean reversion extremes (25%/75% for 4H swing)
     bbPeriod: 20,
     bbStdDev: 2,
-    bbExtremeLong: 0.20,   // 20% = LONG entry in RANGE mode (wider for 4H swing)
-    bbExtremeShort: 0.80,  // 80% = SHORT entry in RANGE mode (wider for 4H swing)
+    bbExtremeLong: 0.25,   // 25% = LONG entry in RANGE mode
+    bbExtremeShort: 0.75,  // 75% = SHORT entry in RANGE mode
 
     // MACD: Momentum confirmation
     macdFast: 12,
@@ -169,6 +178,9 @@ interface MomentumSignals {
   bbLower: number;
   bbMiddle: number;
   bbPosition: number;
+  bbWidth: number;
+  bbWidthAvg: number;
+  bbExpanding: boolean;
   bbBreakoutUp: boolean;
   bbBreakoutDown: boolean;
   priceBreakoutUp: boolean;
@@ -181,7 +193,7 @@ interface MomentumSignals {
   macdBearishCross: boolean;
   atr: number;
   atrPercent: number;
-  regime: 'TREND' | 'RANGE' | 'CHOP';
+  regime: 'MOMENTUM' | 'RANGE' | 'NONE';
   adx: number;
   plusDI: number;
   minusDI: number;
@@ -204,6 +216,8 @@ interface MomentumSignals {
   bearishSignals: number;
   direction: 'LONG' | 'SHORT' | 'NEUTRAL';
   strength: number;
+  // Order Flow Imbalance
+  ofi: number;                    // -1 to +1, positive = bullish pressure
 }
 
 function calculateRSI(candles: Candle[], period: number): number[] {
@@ -619,13 +633,13 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
       williamsR: -50, williamsROversold: false, williamsROverbought: false,
       emaFast: 0, emaSlow: 0, emaBullishCross: false, emaBearishCross: false,
       emaAligned: 'neutral',
-      bbUpper: 0, bbLower: 0, bbMiddle: 0, bbPosition: 0.5,
+      bbUpper: 0, bbLower: 0, bbMiddle: 0, bbPosition: 0.5, bbWidth: 0, bbWidthAvg: 0, bbExpanding: false,
       bbBreakoutUp: false, bbBreakoutDown: false,
       priceBreakoutUp: false, priceBreakoutDown: false,
       candleMomentum: 'neutral',
       macdLine: 0, macdSignal: 0, macdHistogram: 0,
       macdBullishCross: false, macdBearishCross: false,
-      atr: 0, atrPercent: 0, regime: 'CHOP' as const,
+      atr: 0, atrPercent: 0, regime: 'NONE' as const,
       adx: 0, plusDI: 0, minusDI: 0,
       vwap: 0, vwapDeviation: 0, vwapDeviationStd: 0, priceAboveVwap: false,
       sessionVwapAsia: 0, sessionVwapLondon: 0, sessionVwapNy: 0,
@@ -635,6 +649,7 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
       swingHigh: null, swingLow: null,
       bullishSignals: 0, bearishSignals: 0,
       direction: 'NEUTRAL', strength: 0,
+      ofi: 0,
     };
   }
 
@@ -685,6 +700,17 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   const bbBreakoutDown = current.close < bbLower && prev.close >= (bb.lower[bb.lower.length - 2] || bbLower);
   const bbRange = bbUpper - bbLower;
   const bbPosition = bbRange > 0 ? Math.max(0, Math.min(1, (current.close - bbLower) / bbRange)) : 0.5;
+  const bbWidth = current.close > 0 ? (bbRange / current.close) * 100 : 0;
+
+  // BB Width average calculation (for regime detection)
+  const bbWidthLookback = 20;
+  const bbWidths: number[] = [];
+  for (let i = Math.max(0, bb.upper.length - bbWidthLookback); i < bb.upper.length; i++) {
+    const width = bb.middle[i] > 0 ? ((bb.upper[i] - bb.lower[i]) / bb.middle[i]) * 100 : 0;
+    bbWidths.push(width);
+  }
+  const bbWidthAvg = bbWidths.length > 0 ? bbWidths.reduce((a, b) => a + b, 0) / bbWidths.length : bbWidth;
+  const bbExpanding = bbWidth > bbWidthAvg * CONFIG.regime.bbExpandingMultiple;
 
   // Price breakout
   const lookbackCandles = candles.slice(-cfg.breakoutLookback - 1, -1);
@@ -724,17 +750,17 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   const plusDI = adxResult.plusDI[adxResult.plusDI.length - 1] || 0;
   const minusDI = adxResult.minusDI[adxResult.minusDI.length - 1] || 0;
 
-  // Enhanced regime detection using both ATR volatility and ADX trend strength
-  // CHOP: Low volatility AND low ADX (both conditions - dead market)
-  // TREND: High volatility AND high ADX (strong trend)
-  // RANGE: Between the two
-  let regime: 'TREND' | 'RANGE' | 'CHOP';
-  if (atrPercent < CONFIG.regime.minVolatility && adx < 15) {
-    regime = 'CHOP';  // Low volatility AND very weak trend = choppy (was OR, now AND)
-  } else if (atrPercent >= CONFIG.regime.volatilityThreshold && adx >= 20) {
-    regime = 'TREND';  // High volatility AND strong trend = trending (lowered ADX from 25 to 20)
+  // NEW REGIME DETECTION: MOMENTUM / RANGE / NONE
+  // MOMENTUM: ADX > 25 AND BB expanding (width > 1.2x avg) -> trade breakouts, let winners run
+  // RANGE: ADX < 20 AND BB normal (width < 1.5x avg) -> mean reversion with TP1/TP2
+  // NONE: Everything else (transition/squeeze) -> skip trading
+  let regime: 'MOMENTUM' | 'RANGE' | 'NONE';
+  if (adx > CONFIG.regime.adxMomentumMin && bbExpanding) {
+    regime = 'MOMENTUM';  // Strong trend + expanding bands = momentum breakout
+  } else if (adx < CONFIG.regime.adxRangeMax && bbWidth < bbWidthAvg * CONFIG.regime.bbNormalMaxMultiple) {
+    regime = 'RANGE';     // Weak trend + normal bands = range-bound mean reversion
   } else {
-    regime = 'RANGE';  // Between = range-bound
+    regime = 'NONE';      // Transition/squeeze - no edge, skip
   }
 
   // VWAP - Multi-session
@@ -792,7 +818,7 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
     rsiValue, rsiBullishCross, rsiBearishCross, rsiOverbought, rsiOversold,
     williamsR, williamsROversold, williamsROverbought,
     emaFast, emaSlow, emaBullishCross, emaBearishCross, emaAligned,
-    bbUpper, bbLower, bbMiddle, bbPosition, bbBreakoutUp, bbBreakoutDown,
+    bbUpper, bbLower, bbMiddle, bbPosition, bbWidth, bbWidthAvg, bbExpanding, bbBreakoutUp, bbBreakoutDown,
     priceBreakoutUp, priceBreakoutDown,
     candleMomentum,
     macdLine, macdSignal: macdSignalLine, macdHistogram,
@@ -811,6 +837,7 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
     swingLow: swingPoints.swingLow,
     bullishSignals, bearishSignals,
     direction, strength,
+    ofi: 0,  // Default to neutral, updated by OFI fetch
   };
 }
 
@@ -912,7 +939,7 @@ function applySMCContext(
 interface MarketSnapshot {
   price: number;
   timestamp: number;
-  regime: 'TREND' | 'RANGE' | 'CHOP';
+  regime: 'MOMENTUM' | 'RANGE' | 'NONE';
   atrPercent: number;
   bbPosition: number;
   bbWidth: number;
@@ -1110,7 +1137,7 @@ interface PaperTrade {
   pnl?: number;
   pnlPercent?: number;
   mlPrediction: number;
-  regime: 'TREND' | 'RANGE' | 'CHOP';
+  regime: 'MOMENTUM' | 'RANGE' | 'NONE';
   qualityScore: number;
   smcContext: string[];
   entryFeatures?: MarketSnapshot;
@@ -1181,7 +1208,7 @@ class CoinTrader {
       timeframes: new Map(),
       lastCheckTime: 0,
       performance: {
-        byRegime: { TREND: { trades: 0, wins: 0, totalPnl: 0 }, RANGE: { trades: 0, wins: 0, totalPnl: 0 }, CHOP: { trades: 0, wins: 0, totalPnl: 0 } },
+        byRegime: { MOMENTUM: { trades: 0, wins: 0, totalPnl: 0 }, RANGE: { trades: 0, wins: 0, totalPnl: 0 }, NONE: { trades: 0, wins: 0, totalPnl: 0 } },
         bySession: { LONDON: { trades: 0, wins: 0, totalPnl: 0 }, NY_OPEN: { trades: 0, wins: 0, totalPnl: 0 }, NY_AFTERNOON: { trades: 0, wins: 0, totalPnl: 0 }, ASIA: { trades: 0, wins: 0, totalPnl: 0 }, OFF_HOURS: { trades: 0, wins: 0, totalPnl: 0 } },
         byDayOfWeek: { 0: { trades: 0, wins: 0, totalPnl: 0 }, 1: { trades: 0, wins: 0, totalPnl: 0 }, 2: { trades: 0, wins: 0, totalPnl: 0 }, 3: { trades: 0, wins: 0, totalPnl: 0 }, 4: { trades: 0, wins: 0, totalPnl: 0 }, 5: { trades: 0, wins: 0, totalPnl: 0 }, 6: { trades: 0, wins: 0, totalPnl: 0 } },
         recentEdge: 0,
@@ -1203,7 +1230,7 @@ class CoinTrader {
         // Add performance tracking if loading from old state
         if (!savedState.performance) {
           savedState.performance = {
-            byRegime: { TREND: { trades: 0, wins: 0, totalPnl: 0 }, RANGE: { trades: 0, wins: 0, totalPnl: 0 }, CHOP: { trades: 0, wins: 0, totalPnl: 0 } },
+            byRegime: { MOMENTUM: { trades: 0, wins: 0, totalPnl: 0 }, RANGE: { trades: 0, wins: 0, totalPnl: 0 }, NONE: { trades: 0, wins: 0, totalPnl: 0 } },
             bySession: { LONDON: { trades: 0, wins: 0, totalPnl: 0 }, NY_OPEN: { trades: 0, wins: 0, totalPnl: 0 }, NY_AFTERNOON: { trades: 0, wins: 0, totalPnl: 0 }, ASIA: { trades: 0, wins: 0, totalPnl: 0 }, OFF_HOURS: { trades: 0, wins: 0, totalPnl: 0 } },
             byDayOfWeek: { 0: { trades: 0, wins: 0, totalPnl: 0 }, 1: { trades: 0, wins: 0, totalPnl: 0 }, 2: { trades: 0, wins: 0, totalPnl: 0 }, 3: { trades: 0, wins: 0, totalPnl: 0 }, 4: { trades: 0, wins: 0, totalPnl: 0 }, 5: { trades: 0, wins: 0, totalPnl: 0 }, 6: { trades: 0, wins: 0, totalPnl: 0 } },
             recentEdge: 0,
@@ -1524,14 +1551,14 @@ class CoinTrader {
   private analyzeForEntry(): {
     shouldEnter: boolean;
     direction: 'LONG' | 'SHORT' | 'NEUTRAL';
-    regime: 'TREND' | 'RANGE' | 'CHOP';
+    regime: 'MOMENTUM' | 'RANGE' | 'NONE';
     mlPrediction: number;
     qualityScore: number;
     smcContext: SMCContext;
     signals: string[];
     reason: string;
   } {
-    const noEntry = (reason: string, direction: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL', regime: 'TREND' | 'RANGE' | 'CHOP' = 'CHOP', mlPrediction: number = 0.5, qualityScore: number = 0, smcContext: any = { stopTighten: 1, sizeMultiplier: 1, confidenceBoost: 0, adjustments: [] }) => ({
+    const noEntry = (reason: string, direction: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL', regime: 'MOMENTUM' | 'RANGE' | 'NONE' = 'NONE', mlPrediction: number = 0.5, qualityScore: number = 0, smcContext: any = { stopTighten: 1, sizeMultiplier: 1, confidenceBoost: 0, adjustments: [] }) => ({
       shouldEnter: false,
       direction,
       regime,
@@ -1597,23 +1624,45 @@ class CoinTrader {
     // - Never block trades purely on weekly alignment (miss too many opportunities)
     // ═══════════════════════════════════════════════════════════════
 
-    // CHOP: Don't trade (no edge in dead markets)
-    if (regime === 'CHOP') {
-      return noEntry(`CHOP: ATR ${(m4h.atrPercent * 100).toFixed(2)}% < ${(CONFIG.regime.minVolatility * 100).toFixed(1)}% - skip`, direction, 'CHOP');
+    // NONE: Don't trade (transition/squeeze - no edge)
+    signals.push(`${regime}`);
+    signals.push(`ADX:${m4h.adx?.toFixed(0) || '?'}`);
+    signals.push(m4h.bbExpanding ? 'BB↑↑' : `BW:${m4h.bbWidth?.toFixed(1)}%`);
+
+    if (regime === 'NONE') {
+      return noEntry(`NONE: ADX ${m4h.adx?.toFixed(0) || '?'} + BB ${m4h.bbExpanding ? 'expanding' : 'normal'} = transition zone - skip`, direction, 'NONE');
     }
 
-    // TREND mode: Allow NEUTRAL direction to pass through to entry logic
+    // ═══════════════════════════════════════════════════════════════
+    // 4H TREND FILTER - SOFT FILTER (reduces size, doesn't block)
+    // Counter-trend trades allowed at 50% position size for data collection
+    // ═══════════════════════════════════════════════════════════════
+    const trend4h = m4h.emaAligned; // 'bullish', 'bearish', or 'neutral'
+    let trendMultiplier = 1.0;
+
+    const isLongTrend = direction === 'LONG';
+    const counterTrend = (trend4h === 'bullish' && !isLongTrend) || (trend4h === 'bearish' && isLongTrend);
+
+    if (counterTrend) {
+      trendMultiplier = 0.5;  // Half size for counter-trend
+      signals.push('4h↔');    // Counter-trend warning
+    } else if (trend4h === 'bullish') {
+      signals.push('4h↑');
+    } else if (trend4h === 'bearish') {
+      signals.push('4h↓');
+    } else {
+      signals.push('4h~');
+    }
+
+    // MOMENTUM mode: Allow NEUTRAL direction to pass through to entry logic
     // Swing trades can work even without perfect 4H alignment
     // RANGE mode derives direction from BB position (handled below)
     signals.push(`ATR:${(m4h.atrPercent * 100).toFixed(2)}%`);
     signals.push(`BB:${(m4h.bbPosition * 100).toFixed(0)}%`);
 
-    signals.push(`ATR:${(m4h.atrPercent * 100).toFixed(2)}%`);
-    signals.push(`BB:${(m4h.bbPosition * 100).toFixed(0)}%`);
-
-    if (regime === 'TREND') {
+    if (regime === 'MOMENTUM') {
       // ═══════════════════════════════════════════════════════════════
-      // TREND MODE: EMA/breakout entry + VWAP (MACD as filter, not gate)
+      // MOMENTUM MODE: EMA/breakout entry + VWAP (MACD as filter, not gate)
       // ═══════════════════════════════════════════════════════════════
 
       const hasEmaAlign = direction === 'LONG'
@@ -1625,7 +1674,7 @@ class CoinTrader {
         : (m4h.priceBreakoutDown || m4h.bbBreakoutDown);
 
       if (!hasEmaAlign && !hasBreakout) {
-        return { ...noEntry(`TREND: Need EMA align or breakout`, direction, 'TREND'), signals };
+        return { ...noEntry(`MOMENTUM: Need EMA align or breakout`, direction, 'MOMENTUM'), signals };
       }
       signals.push(hasEmaAlign ? 'EMA' : 'BRK');
 
@@ -1641,7 +1690,7 @@ class CoinTrader {
       const macdThreshold = 0.005; // 0.5% threshold
 
       if (macdAgainst > macdThreshold) {
-        return { ...noEntry(`TREND: MACD strongly against (${(macdAgainst * 100).toFixed(2)}%)`, direction, 'TREND'), signals };
+        return { ...noEntry(`MOMENTUM: MACD strongly against (${(macdAgainst * 100).toFixed(2)}%)`, direction, 'MOMENTUM'), signals };
       }
       if (Math.abs(m4h.macdHistogram) > 0.0001) {
         signals.push(`MACD:${(m4h.macdHistogram * 100).toFixed(3)}%`);
@@ -1649,10 +1698,15 @@ class CoinTrader {
 
     } else {
       // ═══════════════════════════════════════════════════════════════
-      // RANGE MODE: Mean reversion at BB extremes + volume spike
-      // Direction OVERRIDDEN by BB position (mean reversion logic):
-      //   BB < 25% → LONG (buy oversold), BB > 75% → SHORT (sell overbought)
+      // RANGE MODE: Only mean revert if NO strong trend (ADX < 20)
+      // In strong trends, price walks bands - don't catch falling knives!
       // ═══════════════════════════════════════════════════════════════
+
+      // ADX check: If trend is strong, skip mean reversion
+      if (m4h.adx && m4h.adx > 20) {
+        return { ...noEntry(`RANGE: ADX ${m4h.adx.toFixed(0)} > 20 - trend too strong for mean reversion`, direction, 'RANGE'), signals };
+      }
+      signals.push(`ADX:${m4h.adx?.toFixed(0) || '?'}<20`);
 
       let rangeDirection: 'LONG' | 'SHORT' | 'SKIP' = 'SKIP';
       if (m4h.bbPosition < CONFIG.momentum.bbExtremeLong) {
@@ -1665,15 +1719,42 @@ class CoinTrader {
         return { ...noEntry(`RANGE: BB in middle (${(m4h.bbPosition * 100).toFixed(0)}%) - need <${(CONFIG.momentum.bbExtremeLong * 100).toFixed(0)}% or >${(CONFIG.momentum.bbExtremeShort * 100).toFixed(0)}%`, direction, 'RANGE'), signals };
       }
 
+      // ═══════════════════════════════════════════════════════════════
+      // SOFT 4H TREND CHECK: Counter-trend allowed with smaller size
+      // The initial trend filter already set trendMultiplier, just add signal
+      // ═══════════════════════════════════════════════════════════════
+      const rangeCounterTrend = (trend4h === 'bullish' && rangeDirection === 'SHORT') || (trend4h === 'bearish' && rangeDirection === 'LONG');
+      if (rangeCounterTrend) {
+        signals.push('4h↔');  // Already marked as counter-trend
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // OFI FILTER - Order Flow Imbalance at BB extremes (optional)
+      // Only filter if we have actual OFI data (not default 0)
+      // ═══════════════════════════════════════════════════════════════
+      const ofi = m4h.ofi || 0;
+      const hasOfiData = m4h.ofi !== undefined && m4h.ofi !== 0;
+      const ofiThreshold = 0.3;
+
+      if (hasOfiData) {
+        if (rangeDirection === 'LONG' && ofi < ofiThreshold) {
+          return { ...noEntry(`RANGE: OFI ${ofi.toFixed(2)} < ${ofiThreshold} - no buying pressure at lower BB`, rangeDirection, 'RANGE'), signals };
+        }
+        if (rangeDirection === 'SHORT' && ofi > -ofiThreshold) {
+          return { ...noEntry(`RANGE: OFI ${ofi.toFixed(2)} > -${ofiThreshold} - no selling pressure at upper BB`, rangeDirection, 'RANGE'), signals };
+        }
+        signals.push(`OFI:${ofi > 0 ? '+' : ''}${ofi.toFixed(2)}`);
+      }
+
       // Override direction for mean reversion
       direction = rangeDirection;
 
       signals.push(`BB-extreme:${(m4h.bbPosition * 100).toFixed(0)}%`);
 
-      if (!m4h.volumeSpike) {
-        return { ...noEntry(`RANGE: Need volume spike (${m4h.volumeRatio.toFixed(1)}x < ${CONFIG.momentum.volumeSpikeMultiple}x)`, rangeDirection, 'RANGE'), signals };
+      // Volume spike is OPTIONAL - bonus if present, not a gate
+      if (m4h.volumeSpike) {
+        signals.push(`VOL:${m4h.volumeRatio.toFixed(1)}x`);
       }
-      signals.push(`VOL:${m4h.volumeRatio.toFixed(1)}x`);
     }
 
     // Entry signal passed - now compute SMC context (lazy)
@@ -1700,6 +1781,12 @@ class CoinTrader {
       // Daily aligns → confidence boost
       smcContext.confidenceBoost += 3;
       signals.push('1d');
+    }
+
+    // Apply 4H trend multiplier for counter-trend trades
+    if (trendMultiplier < 1.0) {
+      smcContext.sizeMultiplier *= trendMultiplier;
+      smcContext.adjustments.push(`4h-counter-trend: -${((1 - trendMultiplier) * 100).toFixed(0)}%size`);
     }
 
     // Calculate quality score (will be updated with weekly alignment later)
@@ -1749,7 +1836,7 @@ class CoinTrader {
     }
 
     if (m4h.isKillZone) signals.push(`KZ:${m4h.killZone}`);
-    if (m4h.volumeSpike && regime === 'TREND') signals.push(`VOL:${m4h.volumeRatio.toFixed(1)}x`);
+    if (m4h.volumeSpike && regime === 'MOMENTUM') signals.push(`VOL:${m4h.volumeRatio.toFixed(1)}x`);
 
     // Pre-validate stop distance (avoid ghost signals for low-price coins)
     const currentPrice = tf4h.candles[tf4h.candles.length - 1].close;
@@ -1994,7 +2081,7 @@ class CoinTrader {
 
     // Regime-specific TP levels
     let tp1R: number, tp2R: number, tp3R: number;
-    if (analysis.regime === 'TREND') {
+    if (analysis.regime === 'MOMENTUM') {
       tp1R = 1.5; tp2R = 3.0; tp3R = 4.5;  // Let trends run
     } else {
       tp1R = 1.5; tp2R = 2.0; tp3R = 3.5;  // Mean reversion has ceilings
@@ -2073,7 +2160,7 @@ class CoinTrader {
     this.state.trades.push(trade);
     this.saveState();
 
-    console.log(`\n${analysis.regime === 'TREND' ? '🔥' : '📊'} ${this.state.symbol}: ENTERED ${trade.direction} [${analysis.regime} | ${stopType} STOP]`);
+    console.log(`\n${analysis.regime === 'MOMENTUM' ? '🔥' : '📊'} ${this.state.symbol}: ENTERED ${trade.direction} [${analysis.regime} | ${stopType} STOP]`);
     console.log(`   Entry: $${trade.entryPrice.toFixed(2)} | SL: $${trade.stopLoss.toFixed(2)} (${riskPct.toFixed(1)}% risk)`);
     console.log(`   TP1: $${trade.takeProfit1.toFixed(2)} (${tp1R}R) | TP2: $${trade.takeProfit2.toFixed(2)} (${tp2R}R) | TP3: $${trade.takeProfit3.toFixed(2)} (${tp3R}R)`);
     console.log(`   Quality: ${analysis.qualityScore}/100 | ML: ${(analysis.mlPrediction * 100).toFixed(0)}% | Signals: ${analysis.signals.join('+')}`);
@@ -2478,10 +2565,10 @@ class MultiCoinOrchestrator {
     console.log('╚═══════════════════════════════════════════════════════════════╝\n');
 
     console.log('Entry System:');
-    console.log(`  Mode:            Regime-based (TREND/RANGE/CHOP)`);
-    console.log(`  TREND entry:     MACD + (EMA align OR breakout) + VWAP`);
-    console.log(`  RANGE entry:     BB extreme (<20% / >80%) + Volume spike`);
-    console.log(`  CHOP:            Skip (ATR < ${(CONFIG.regime.minVolatility * 100).toFixed(1)}%)`);
+    console.log(`  Mode:            Regime-based (MOMENTUM/RANGE/NONE)`);
+    console.log(`  MOMENTUM entry:  ADX>${CONFIG.regime.adxMomentumMin} + BB expanding + Breakout`);
+    console.log(`  RANGE entry:     ADX<${CONFIG.regime.adxRangeMax} + BB extreme (${CONFIG.regime.bbExtremeLong*100}%/${CONFIG.regime.bbExtremeShort*100}%)`);
+    console.log(`  NONE:            Skip (transition/squeeze)`);
     console.log(`  SMC/ICT:         Context adjusters (stop/size/confidence)`);
     console.log(`  Trailing Stop:   ${CONFIG.trailingStopPct}% after TP1`);
     console.log(`  ML Threshold:    ${CONFIG.minWinProbability === 0 ? 'BYPASSED (data collection)' : `${(CONFIG.minWinProbability * 100).toFixed(0)}%`}`);
@@ -2602,15 +2689,23 @@ class MultiCoinOrchestrator {
     console.log(`   Checking every ${CONFIG.checkIntervalMs / 1000}s`);
     console.log('   Press Ctrl+C to stop\n\n');
 
+    let headerPrinted = false;
+
     while (this.running) {
       this.cycleCount++;
       const timestamp = new Date().toLocaleTimeString();
       const cycleStart = Date.now();
 
-      process.stdout.write('\x1B[2J\x1B[0f');
-      console.log('\n╔═══════════════════════════════════════════════════════════╗');
-      console.log(`║  REGIME SWING TRADER - Cycle: ${this.cycleCount} | ${timestamp}      ║`);
-      console.log('╚═══════════════════════════════════════════════════════════╝\n');
+      // Show header only once at startup
+      if (!headerPrinted) {
+        console.log('\n╔═══════════════════════════════════════════════════════════╗');
+        console.log(`║  REGIME SWING TRADER - Started                              ║`);
+        console.log('╚═══════════════════════════════════════════════════════════╝\n');
+        headerPrinted = true;
+      }
+
+      // Small cycle marker each iteration
+      console.log(`\n🔄 SWING Cycle ${this.cycleCount} | ${timestamp}`);
 
       const results: Array<{ symbol: string; price: number; result: any }> = [];
       for (const symbol of SYMBOLS) {
@@ -2747,7 +2842,7 @@ class MultiCoinOrchestrator {
 
       // Regime distribution + filter diagnostic every 10 cycles
       if (this.cycleCount % 10 === 0) {
-        const regimeCounts: Record<string, number> = { TREND: 0, RANGE: 0, CHOP: 0 };
+        const regimeCounts: Record<string, number> = { MOMENTUM: 0, RANGE: 0, NONE: 0 };
         const blockerCounts: Record<string, number> = {};
 
         for (const { result } of results) {
@@ -2763,7 +2858,7 @@ class MultiCoinOrchestrator {
           }
         }
 
-        console.log(`\nREGIME DISTRIBUTION: TREND:${regimeCounts.TREND} | RANGE:${regimeCounts.RANGE} | CHOP:${regimeCounts.CHOP}`);
+        console.log(`\nREGIME DISTRIBUTION: MOMENTUM:${regimeCounts.MOMENTUM} | RANGE:${regimeCounts.RANGE} | NONE:${regimeCounts.NONE}`);
 
         const monitorCount = results.filter(r => r.result.status === 'MONITOR').length;
         if (monitorCount > 0) {

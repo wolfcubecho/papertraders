@@ -48,10 +48,11 @@ const SYMBOLS = [
 // ═══════════════════════════════════════════════════════════════
 const CONFIG = {
   mode: 'MOMENTUM_SCALP',
-  intervals: ['1m', '5m', '15m'] as const,
+  intervals: ['1m', '5m', '15m', '4h'] as const,  // Added 4h for trend filter
   primaryInterval: '5m' as const,  // 5m for scalping momentum
   checkIntervalMs: 5000,           // Check every 5s for quick entries
   minCandlesRequired: 50,          // Need less history for momentum
+  // maxOpenPositions: 5,          // DISABLED - paper trader needs data
 
   // ═══════════════════════════════════════════════════════════════
   // REPORTING MODE
@@ -68,9 +69,11 @@ const CONFIG = {
   // MOMENTUM THRESHOLDS
   // ═══════════════════════════════════════════════════════════════
   momentum: {
-    // Volume spike detection (QUANT-LEVEL: 1.1x for more entries with quality edge)
-    volumeSpikeMultiple: 1.1,      // Volume > 1.1x average = spike (optimized for 5m timeframe)
-    volumeAvgPeriod: 20,           // 20-candle average for comparison
+    // Volume spike detection (MOMENTUM needs 2x, RANGE needs 1.5x)
+    volumeSpikeMultipleMomentum: 2.0,   // MOMENTUM mode: Volume > 2x average
+    volumeSpikeMultipleRange: 1.5,      // RANGE mode: Volume > 1.5x average
+    volumeSpikeMultiple: 1.5,           // Default (used for signal counting)
+    volumeAvgPeriod: 20,                // 20-candle average for comparison
 
     // RSI settings
     rsiPeriod: 14,
@@ -94,12 +97,12 @@ const CONFIG = {
     minBodyRatio: 0.6,             // Body must be > 60% of candle range
 
     // Confluence required (increased for quality entries)
-    minSignals: 2,                 // Need at least 2 momentum signals (was 1 - improve entry quality)
+    minSignals: 2,                 // Need at least 2 momentum signals
 
-    // Pullback entry thresholds (widened for more entries)
-    pullbackToEmaPct: 0.004,        // Enter when price within 0.4% of EMA (widened from 0.2%)
-    pullbackToVwapPct: 0.004,      // Enter when price within 0.4% of VWAP (widened from 0.2%)
-    maxDistanceFromEma: 0.015,     // Skip if price > 1.5% from EMA (widened from 1%)
+    // Pullback entry thresholds (for RANGE mode)
+    pullbackToEmaPct: 0.004,        // Enter when price within 0.4% of EMA
+    pullbackToVwapPct: 0.004,      // Enter when price within 0.4% of VWAP
+    maxDistanceFromEma: 0.015,     // Skip if price > 1.5% from EMA
 
     // MACD settings
     macdFast: 12,
@@ -108,21 +111,26 @@ const CONFIG = {
   },
 
   // ═══════════════════════════════════════════════════════════════
-  // DUAL MODE: TREND vs RANGE
+  // REGIME DETECTION: MOMENTUM vs RANGE vs NONE
   // ═══════════════════════════════════════════════════════════════
   regime: {
-    // Volatility threshold to switch modes (ATR % of price)
-    volatilityThreshold: 0.008,    // 0.8% = TREND mode
-    minVolatility: 0.002,          // 0.2% = minimum to trade at all. Below = CHOP, skip entirely.
     atrPeriod: 14,
 
-    // BB mean reversion thresholds (tightened for RANGE mode)
-    rangeLongThreshold: 0.25,      // BB < 25% for LONG entries (was 30%)
-    rangeShortThreshold: 0.75,     // BB > 75% for SHORT entries (was 70%)
+    // ADX thresholds for regime classification
+    adxMomentumMin: 25,            // ADX > 25 = strong trend
+    adxRangeMax: 20,               // ADX < 20 = weak/range-bound
 
-    // TREND mode: pullback entries to EMA/VWAP (NOT breakouts)
-    // RANGE mode: mean reversion at tighter BB extremes
-    // CHOP mode (< minVolatility): do NOT trade - no edge in dead markets
+    // BB width thresholds (as multiple of average)
+    bbExpandingMultiple: 1.2,      // BB width > 1.2x avg = expanding/volatile
+    bbNormalMaxMultiple: 1.5,      // BB width < 1.5x avg = normal (not squeeze)
+
+    // BB mean reversion thresholds (for RANGE mode)
+    rangeLongThreshold: 0.25,      // BB < 25% for LONG entries
+    rangeShortThreshold: 0.75,     // BB > 75% for SHORT entries
+
+    // MOMENTUM mode: breakout entries, trail at -1R (no fixed TPs)
+    // RANGE mode: mean reversion with TP1/TP2
+    // NONE mode: transition/squeeze - skip trading
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -138,27 +146,39 @@ const CONFIG = {
   minWinProbability: 0,           // Disabled - ML model AUC 0.49 is worse than random! Collecting data first.
 
   // ═══════════════════════════════════════════════════════════════
-  // ENTRY/EXIT - QUICK SCALP TARGETS
+  // ENTRY/EXIT - DUAL MODE TARGETS
   // ═══════════════════════════════════════════════════════════════
   targets: {
     stopLossPct: 0.50,             // Fallback SL % (primary uses ATR 1.5x)
-    // FIXED % TARGETS for true scalping - lock profits fast!
-    tp1Pct: 0.50,                  // TP1: 0.5% - quick profit, easy to hit
-    tp2Pct: 1.0,                   // TP2: 1.0% - solid scalp target
-    tp3Pct: 1.5,                   // TP3: 1.5% - home run
-    trailingActivatePct: 0.30,    // Activate trailing after 0.3% profit
-    trailingDistancePct: 0.15,    // Trail tight by 0.15%
-    tp1ClosePct: 0.50,             // Close 50% at TP1 (lock profit early)
-    tp2ClosePct: 0.30,             // Close 30% at TP2
-    tp3ClosePct: 0.20,             // Close 20% at TP3
+    // RANGE MODE: BB-BASED TARGETS (Mean Reversion)
+    tp1ClosePct: 0.70,             // Close 70% at Middle BB (TP1)
+    tp2ClosePct: 0.30,             // Close 30% at Opposite BB (TP2)
+    protectedProfitR: 0.2,         // After TP1, SL moves to Entry + 0.2R
+    phase2TriggerR: 0.7,           // When profit reaches TP2 - 0.3R
+    phase2TrailR: 0.5,             // Trail at 0.5R distance
+    // MOMENTUM MODE: Breakout trail (no fixed TPs)
+    momentumTrailR: 1.0,           // Trail at -1R from entry (let winners run)
+    momentumTrailAfterR: 0.5,      // Start trailing after 0.5R profit
+    // Time stop for runners
+    timeStopCandles: 5,            // Exit remaining position after 5 candles
   },
 
   // ═══════════════════════════════════════════════════════════════
-  // TIMING - TRUE SCALPING
+  // SCRAPER TIMEOUT - PREVENT TILT/OVERTRADING
   // ═══════════════════════════════════════════════════════════════
-  maxHoldMinutes: 30,              // Max 30 mins - true scalping, in and out!
+  consecutiveLossCooldownMs: 30 * 60 * 1000,  // 30 min break after 3 losses
+  maxConsecutiveLosses: 3,                    // Trigger cooldown after this many
+  consecutiveWinsCooldownMs: 10 * 60 * 1000,  // 10 min break after 5 wins (overconfidence check)
+  maxConsecutiveWins: 5,                      // Trigger cooldown after this many
+
+  // ═══════════════════════════════════════════════════════════════
+  // TIMING - TRUE SCALPING (Quality over Quantity)
+  // ═══════════════════════════════════════════════════════════════
+  maxHoldMinutes: 15,              // Max 15 mins - faster exits for dead trades
   cooldownMs: 60_000,              // 1 minute cooldown between trades
   onlyEnterOnCandleClose: false,   // Scalper can enter mid-candle
+  maxDailyTrades: 9999,            // No limit - need all data for paper trading
+  // Overtrading = 34% less profitable. Frequency is enemy of edge.
 
   // ═══════════════════════════════════════════════════════════════
   // RISK & FEES
@@ -201,6 +221,9 @@ interface MomentumSignals {
   bbLower: number;
   bbMiddle: number;
   bbPosition: number;  // 0 = at lower band, 0.5 = middle, 1 = at upper band
+  bbWidth: number;     // Band width as % of price (for squeeze detection)
+  bbWidthAvg: number;  // Average BB width over lookback period
+  bbExpanding: boolean; // BB width > 1.2x avg = expanding
   bbBreakoutUp: boolean;
   bbBreakoutDown: boolean;
   priceBreakoutUp: boolean;
@@ -217,7 +240,7 @@ interface MomentumSignals {
   // Volatility / Regime
   atr: number;
   atrPercent: number;  // ATR as % of price
-  regime: 'TREND' | 'RANGE' | 'CHOP';
+  regime: 'MOMENTUM' | 'RANGE' | 'NONE';  // NEW: MOMENTUM/RANGE/NONE
   adx: number;         // ADX trend strength (0-100)
   plusDI: number;      // +DI for bullish strength
   minusDI: number;     // -DI for bearish strength
@@ -334,7 +357,7 @@ interface OFISignal {
  * OFI = (bid_volume - ask_volume) / (bid_volume + ask_volume)
  * Uses top N levels for calculation (default 5)
  */
-function calculateOFI(depth: OrderBookDepth, levels: number = 5): OFISignal {
+function calculateOFI(depth: OrderBookDepth, levels: number = 10): OFISignal {
   const bids = depth.bids.slice(0, levels);
   const asks = depth.asks.slice(0, levels);
 
@@ -774,13 +797,13 @@ function analyzeMomentum(candles: Candle[], ofiSignal?: OFISignal): MomentumSign
       williamsR: -50, williamsROversold: false, williamsROverbought: false,
       emaFast: 0, emaSlow: 0, emaBullishCross: false, emaBearishCross: false,
       emaAligned: 'neutral',
-      bbUpper: 0, bbLower: 0, bbMiddle: 0, bbPosition: 0.5,
+      bbUpper: 0, bbLower: 0, bbMiddle: 0, bbPosition: 0.5, bbWidth: 0, bbWidthAvg: 0, bbExpanding: false,
       bbBreakoutUp: false, bbBreakoutDown: false,
       priceBreakoutUp: false, priceBreakoutDown: false,
       candleMomentum: 'neutral',
       macdLine: 0, macdSignal: 0, macdHistogram: 0,
       macdBullishCross: false, macdBearishCross: false,
-      atr: 0, atrPercent: 0, regime: 'CHOP' as 'TREND' | 'RANGE' | 'CHOP',
+      atr: 0, atrPercent: 0, regime: 'NONE' as 'MOMENTUM' | 'RANGE' | 'NONE',
       adx: 0, plusDI: 0, minusDI: 0,
       vwap: 0, vwapDeviation: 0, vwapDeviationStd: 0, priceAboveVwap: false,
       sessionVwapAsia: 0, sessionVwapLondon: 0, sessionVwapNy: 0,
@@ -842,6 +865,8 @@ function analyzeMomentum(candles: Candle[], ofiSignal?: OFISignal): MomentumSign
   // BB Position: 0 = at lower band, 0.5 = middle, 1 = at upper band
   const bbRange = bbUpper - bbLower;
   const bbPosition = bbRange > 0 ? Math.max(0, Math.min(1, (current.close - bbLower) / bbRange)) : 0.5;
+  // BB Width: as % of price (for squeeze detection - narrow bands = explosive move coming)
+  const bbWidth = current.close > 0 ? (bbRange / current.close) * 100 : 0;
 
   // Price breakout (new high/low)
   const lookbackCandles = candles.slice(-cfg.breakoutLookback - 1, -1);
@@ -881,17 +906,28 @@ function analyzeMomentum(candles: Candle[], ofiSignal?: OFISignal): MomentumSign
   const plusDI = adxResult.plusDI[adxResult.plusDI.length - 1] || 0;
   const minusDI = adxResult.minusDI[adxResult.minusDI.length - 1] || 0;
 
-  // Enhanced regime detection using both ATR volatility and ADX trend strength
-  // CHOP: Low volatility AND low ADX (both conditions - dead market)
-  // TREND: High volatility AND high ADX (strong trend)
-  // RANGE: Between the two
-  let regime: 'TREND' | 'RANGE' | 'CHOP';
-  if (atrPercent < CONFIG.regime.minVolatility && adx < 15) {
-    regime = 'CHOP';  // Low volatility AND very weak trend = choppy (was OR, now AND)
-  } else if (atrPercent >= CONFIG.regime.volatilityThreshold && adx >= 20) {
-    regime = 'TREND';  // High volatility AND strong trend = trending (lowered ADX from 25 to 20)
+  // BB Width average calculation (for regime detection)
+  // Calculate BB widths for last 20 candles, find average
+  const bbWidthLookback = 20;
+  const bbWidths: number[] = [];
+  for (let i = Math.max(0, bb.upper.length - bbWidthLookback); i < bb.upper.length; i++) {
+    const width = bb.middle[i] > 0 ? ((bb.upper[i] - bb.lower[i]) / bb.middle[i]) * 100 : 0;
+    bbWidths.push(width);
+  }
+  const bbWidthAvg = bbWidths.length > 0 ? bbWidths.reduce((a, b) => a + b, 0) / bbWidths.length : bbWidth;
+  const bbExpanding = bbWidth > bbWidthAvg * CONFIG.regime.bbExpandingMultiple;
+
+  // NEW REGIME DETECTION: MOMENTUM / RANGE / NONE
+  // MOMENTUM: ADX > 25 AND BB expanding (width > 1.2x avg) -> trade breakouts, let winners run
+  // RANGE: ADX < 20 AND BB normal (width < 1.5x avg) -> mean reversion with TP1/TP2
+  // NONE: Everything else (transition/squeeze) -> skip trading
+  let regime: 'MOMENTUM' | 'RANGE' | 'NONE';
+  if (adx > CONFIG.regime.adxMomentumMin && bbExpanding) {
+    regime = 'MOMENTUM';  // Strong trend + expanding bands = momentum breakout
+  } else if (adx < CONFIG.regime.adxRangeMax && bbWidth < bbWidthAvg * CONFIG.regime.bbNormalMaxMultiple) {
+    regime = 'RANGE';     // Weak trend + normal bands = range-bound mean reversion
   } else {
-    regime = 'RANGE';  // Between = range-bound
+    regime = 'NONE';      // Transition/squeeze - no edge, skip
   }
 
   // VWAP (Institutional anchor) - Multi-session
@@ -971,7 +1007,7 @@ function analyzeMomentum(candles: Candle[], ofiSignal?: OFISignal): MomentumSign
     rsiValue, rsiBullishCross, rsiBearishCross, rsiOverbought, rsiOversold,
     williamsR, williamsROversold, williamsROverbought,
     emaFast, emaSlow, emaBullishCross, emaBearishCross, emaAligned,
-    bbUpper, bbLower, bbMiddle, bbPosition, bbBreakoutUp, bbBreakoutDown,
+    bbUpper, bbLower, bbMiddle, bbPosition, bbWidth, bbWidthAvg, bbExpanding, bbBreakoutUp, bbBreakoutDown,
     priceBreakoutUp, priceBreakoutDown,
     candleMomentum,
     macdLine, macdSignal: macdSignalLine, macdHistogram,
@@ -1004,7 +1040,7 @@ function analyzeMomentum(candles: Candle[], ofiSignal?: OFISignal): MomentumSign
 interface MarketSnapshot {
   price: number;
   timestamp: number;
-  regime: 'TREND' | 'RANGE' | 'CHOP';
+  regime: 'MOMENTUM' | 'RANGE' | 'NONE';
   atrPercent: number;
   bbPosition: number;
   bbWidth: number;
@@ -1035,22 +1071,23 @@ interface PaperTrade {
   entryTime: number;
   stopLoss: number;
   originalStopLoss: number;
-  takeProfit1: number;
-  takeProfit2: number;
-  takeProfit3: number;
+  tp1DistanceR: number;            // R = TP1 distance (tp1 - entry), used for all R calculations
+  takeProfit1: number;              // Middle BB (for RANGE mode)
+  takeProfit2: number;              // Opposite BB band (for RANGE mode)
+  isMomentumMode: boolean;          // true = MOMENTUM (trail only), false = RANGE (TP1/TP2)
   trailingStop: number | null;
   originalPositionSize: number;
   currentPositionSize: number;
+  candlesHeld: number;              // Track for time stop
   tp1Hit: boolean;
   tp2Hit: boolean;
-  tp3Hit: boolean;
-  stopLossMovedToBreakeven: boolean;
+  phase2Active: boolean;            // Phase 2 trailing active (RANGE mode) or trailing active (MOMENTUM mode)
   status: 'OPEN' | 'CLOSED';
   pnl?: number;
   pnlPercent?: number;
   exitPrice?: number;
   exitTime?: number;
-  exitReason?: 'TP1' | 'TP2' | 'TP3' | 'SL' | 'TRAILING' | 'TIMEOUT' | 'MANUAL';
+  exitReason?: 'TP1' | 'TP2' | 'SL' | 'TRAILING' | 'TIMEOUT' | 'MANUAL' | 'TREND_REVERSAL';
   feesPaid: number;
   momentumStrength: number;
   signals: string[];
@@ -1103,6 +1140,8 @@ interface CoinTradingState {
   openTrade: PaperTrade | null;
   trades: PaperTrade[];
   cooldownUntil: number;
+  consecutiveLosses: number;        // Track for scraper timeout
+  consecutiveWins: number;          // Track for overconfidence timeout
   stats: {
     totalTrades: number;
     wins: number;
@@ -1135,6 +1174,8 @@ class CoinTrader {
       openTrade: null,
       trades: [],
       cooldownUntil: 0,
+      consecutiveLosses: 0,
+      consecutiveWins: 0,
       stats: {
         totalTrades: 0,
         wins: 0,
@@ -1166,6 +1207,8 @@ class CoinTrader {
         this.state.openTrade = saved.openTrade || null;
         this.state.trades = saved.trades || [];
         this.state.cooldownUntil = saved.cooldownUntil || 0;
+        this.state.consecutiveLosses = saved.consecutiveLosses || 0;
+        this.state.consecutiveWins = saved.consecutiveWins || 0;
         this.state.stats = saved.stats || this.state.stats;
       }
     } catch (e) {
@@ -1186,6 +1229,8 @@ class CoinTrader {
         openTrade: this.state.openTrade,
         trades: this.state.trades.slice(-100),  // Keep last 100
         cooldownUntil: this.state.cooldownUntil,
+        consecutiveLosses: this.state.consecutiveLosses,
+        consecutiveWins: this.state.consecutiveWins,
         stats: this.state.stats,
         savedAt: new Date().toISOString(),
       };
@@ -1223,6 +1268,8 @@ class CoinTrader {
       openTrade: null,
       trades: [],
       cooldownUntil: 0,
+      consecutiveLosses: 0,
+      consecutiveWins: 0,
       stats: {
         totalTrades: 0,
         wins: 0,
@@ -1372,6 +1419,7 @@ class CoinTrader {
     const tf5m = this.state.timeframes.get('5m');
     const tf1m = this.state.timeframes.get('1m');
     const tf15m = this.state.timeframes.get('15m');
+    const tf4h = this.state.timeframes.get('4h');
 
     if (!tf5m || tf5m.candles.length < CONFIG.minCandlesRequired) {
       return { shouldEnter: false, direction: 'NEUTRAL', strength: 0, signals: [], reason: 'No data', mlPrediction: 0.5 };
@@ -1380,6 +1428,7 @@ class CoinTrader {
     const m5 = tf5m.momentum;
     const m1 = tf1m?.momentum;
     const m15 = tf15m?.momentum;
+    const m4h = tf4h?.momentum;
 
     const signals: string[] = [];
 
@@ -1406,6 +1455,56 @@ class CoinTrader {
       return { shouldEnter: false, direction: 'NEUTRAL', strength: 0, signals, reason: 'No clear direction', mlPrediction: 0.5 };
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // 4H TREND FILTER - SOFT FILTER (reduces size, doesn't block)
+    // Counter-trend trades allowed at 50% position size for data collection
+    // ═══════════════════════════════════════════════════════════════
+    const isLong = direction === 'LONG';
+    let trendMultiplier = 1.0;  // Position size multiplier
+
+    if (m4h) {
+      const trend4h = m4h.emaAligned; // 'bullish', 'bearish', or 'neutral'
+
+      // Counter-trend: Allow but reduce position size by 50%
+      const counterTrend = (trend4h === 'bullish' && !isLong) || (trend4h === 'bearish' && isLong);
+
+      if (counterTrend) {
+        trendMultiplier = 0.5;  // Half size for counter-trend
+        signals.push('4h↔');    // Counter-trend warning
+      } else if (trend4h === 'bullish') {
+        signals.push('4h↑');
+      } else if (trend4h === 'bearish') {
+        signals.push('4h↓');
+      } else {
+        signals.push('4h~');
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 15M TREND FILTER - CRITICAL FOR AVOIDING FALLING KNIVES
+    // ═══════════════════════════════════════════════════════════════
+    const m15Aligned = m15 && m15.emaAligned === (isLong ? 'bullish' : 'bearish');
+    const m15Against = m15 && m15.emaAligned === (isLong ? 'bearish' : 'bullish');
+
+    if (m15Against) {
+      // 15m trend is AGAINST us - need STRONG reversal confirmation
+      // Require: candle moving in our direction + volume spike
+      const candleConfirm = m5.candleMomentum === (isLong ? 'bullish' : 'bearish');
+      if (!candleConfirm) {
+        return {
+          shouldEnter: false,
+          direction,
+          strength: 0,
+          signals,
+          reason: `15m against (${m15.emaAligned}) - need candle confirm`,
+          mlPrediction: 0.5,
+        };
+      }
+      signals.push('15m⚠');  // Warning: counter-trend
+    } else if (m15Aligned) {
+      signals.push('15m✓');
+    }
+
     // Confirm with 1m (optional boost)
     let strengthBoost = 0;
     if (m1 && m1.direction === direction) {
@@ -1413,13 +1512,8 @@ class CoinTrader {
       signals.push('1m✓');
     }
 
-    // Confirm with 15m trend (optional boost)
-    if (m15 && m15.emaAligned === (direction === 'LONG' ? 'bullish' : 'bearish')) {
-      strengthBoost += 0.1;
-      signals.push('15m✓');
-    }
-
-    const strength = Math.min(1, m5.strength + strengthBoost);
+    // Apply trend multiplier for counter-trend trades (50% size reduction)
+    let strength = Math.min(1, (m5.strength + strengthBoost) * trendMultiplier);
 
     // Need minimum signals (skip for RANGE - direction comes from BB position, not momentum)
     if (regime !== 'RANGE') {
@@ -1445,133 +1539,85 @@ class CoinTrader {
     if (m5.isKillZone) signals.push(`KZ:${m5.killZone}`);
 
     // ═══════════════════════════════════════════════════════════════
-    // TRI-MODE: TREND vs RANGE vs CHOP
+    // REGIME: MOMENTUM vs RANGE vs NONE
     // ═══════════════════════════════════════════════════════════════
     const bbPos = m5.bbPosition;
     signals.push(`${regime}`);
     signals.push(`BB:${(bbPos * 100).toFixed(0)}%`);
+    signals.push(`ADX:${m5.adx?.toFixed(0) || '?'}`);
+    signals.push(m5.bbExpanding ? 'BB↑↑' : `BW:${m5.bbWidth?.toFixed(1)}%`);
 
-    // CHOP MODE: Do NOT trade - no edge in dead/grinding markets
-    if (regime === 'CHOP') {
+    // NONE MODE: Transition/squeeze - no edge, skip trading
+    if (regime === 'NONE') {
       return {
         shouldEnter: false,
         direction,
         strength,
         signals,
-        reason: `CHOP: ATR ${(m5.atrPercent * 100).toFixed(2)}% too low - skip`,
+        reason: `NONE: ADX ${m5.adx?.toFixed(0) || '?'} + BB ${m5.bbExpanding ? 'expanding' : 'normal'} = transition zone - skip`,
         mlPrediction: 0.5,
       };
     }
 
-    if (regime === 'TREND') {
+    if (regime === 'MOMENTUM') {
       // ═══════════════════════════════════════════════════════════════
-      // TREND MODE: Pullback entries to EMA/VWAP (NOT breakouts!)
-      // Entry: Price must pull back near EMA9/VWAP, THEN confirm with other signals
-      // This reduces SL hits by entering at better prices
+      // MOMENTUM MODE: Breakout entries (ADX > 25 + BB expanding)
+      // Entry: Price breakout or BB breakout with volume
+      // Exit: Trail at -1R from entry (let winners run, no fixed TP)
       // ═══════════════════════════════════════════════════════════════
-      signals.push(`ATR:${(m5.atrPercent * 100).toFixed(2)}%`);
-
       const isLong = direction === 'LONG';
       const currentPrice = tf5m.candles[tf5m.candles.length - 1].close;
 
-      // 1. Check EMA alignment (trend definition)
-      const hasEmaAlign = isLong
-        ? m5.emaAligned === 'bullish'
-        : m5.emaAligned === 'bearish';
-
-      if (!hasEmaAlign) {
+      // 1. VWAP alignment (price above VWAP for longs, below for shorts)
+      const hasVwapAlign = isLong ? m5.priceAboveVwap : !m5.priceAboveVwap;
+      if (!hasVwapAlign) {
         return {
           shouldEnter: false,
           direction,
           strength,
           signals,
-          reason: `TREND: No EMA alignment (${m5.emaAligned})`,
+          reason: `MOMENTUM: VWAP not aligned (${m5.priceAboveVwap ? 'above' : 'below'} VWAP)`,
           mlPrediction: 0.5,
         };
       }
+      signals.push('VWAP✓');
 
-      // 2. Check if price is in pullback zone (near EMA or VWAP)
-      const emaDistance = Math.abs((currentPrice - m5.emaFast) / currentPrice);
-      const vwapDistance = Math.abs(m5.vwapDeviation);
-      const nearEma = emaDistance <= CONFIG.momentum.pullbackToEmaPct;
-      const nearVwap = vwapDistance <= CONFIG.momentum.pullbackToVwapPct;
-      const tooFarFromEma = emaDistance > CONFIG.momentum.maxDistanceFromEma;
+      // 2. Breakout required (BB breakout OR price breakout) - momentum IS confirmation
+      const hasBreakout = isLong
+        ? (m5.bbBreakoutUp || m5.priceBreakoutUp)
+        : (m5.bbBreakoutDown || m5.priceBreakoutDown);
 
-      if (tooFarFromEma) {
+      if (!hasBreakout) {
         return {
           shouldEnter: false,
           direction,
           strength,
           signals,
-          reason: `TREND: Price too far from EMA (${(emaDistance * 100).toFixed(2)}% > ${(CONFIG.momentum.maxDistanceFromEma * 100).toFixed(1)}%)`,
+          reason: `MOMENTUM: No breakout (need BB or price break)`,
           mlPrediction: 0.5,
         };
       }
+      signals.push(isLong ? (m5.bbBreakoutUp ? 'BB↑' : 'BRK↑') : (m5.bbBreakoutDown ? 'BB↓' : 'BRK↓'));
 
-      if (!nearEma && !nearVwap) {
+      // 3. Volume spike REQUIRED (2x for MOMENTUM mode)
+      const volumeThreshold = CONFIG.momentum.volumeSpikeMultipleMomentum;  // 2x
+      if (m5.volumeRatio < volumeThreshold) {
         return {
           shouldEnter: false,
           direction,
           strength,
           signals,
-          reason: `TREND: Price not in pullback zone (EMA:${(emaDistance * 100).toFixed(2)}%, VWAP:${(vwapDistance * 100).toFixed(2)}%)`,
-          mlPrediction: 0.5,
-        };
-      }
-
-      if (nearEma) signals.push('EMA✓');
-      if (nearVwap) signals.push('VWAP✓');
-
-      // 3. MACD confirmation (OPTIONAL - bonus if present, not required)
-      const hasMacdConfirm = isLong
-        ? (m5.macdBullishCross || m5.macdHistogram > 0)
-        : (m5.macdBearishCross || m5.macdHistogram < 0);
-      if (hasMacdConfirm) signals.push('MACD✓');
-
-      // 4. Volume spike REQUIRED (only profitable filter from data)
-      if (!m5.volumeSpike) {
-        return {
-          shouldEnter: false,
-          direction,
-          strength,
-          signals,
-          reason: `TREND: Need volume spike (current:${m5.volumeRatio.toFixed(1)}x)`,
+          reason: `MOMENTUM: Need volume > ${volumeThreshold}x (current:${m5.volumeRatio.toFixed(1)}x)`,
           mlPrediction: 0.5,
         };
       }
       signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x`);
 
-      // 5. Williams %R confirmation (optional bonus)
-      const williamsConfirm = isLong
-        ? (m5.williamsROversold || m5.williamsR < -80)
-        : (m5.williamsROverbought || m5.williamsR > -20);
-      if (williamsConfirm) signals.push('W%R✓');
-
-      // ═══════════════════════════════════════════════════════════════
-      // R:R FILTER: Stop distance check (updated for ATR-based SL)
-      // ═══════════════════════════════════════════════════════════════
-      const tf15m = this.state.timeframes.get('15m');
-      const m15 = tf15m?.momentum;
-
-      // Calculate stop distance (same logic as enterTrade - uses ATR)
-      const atrStopDistance = (m5.atr || currentPrice * 0.005) * 1.5;
-      const maxStopDistance = currentPrice * 0.015; // 1.5% max
-
-      // Use ATR-based stop for R:R check
-      const estimatedStopDistance = Math.min(atrStopDistance, maxStopDistance);
-
-      // R:R filter: stop distance as % of price (updated for ATR-based SL)
-      const stopPct = (estimatedStopDistance / currentPrice) * 100;
-      if (stopPct > 1.5) {  // Max 1.5% stop (matches ATR cap)
-        return {
-          shouldEnter: false,
-          direction,
-          strength,
-          signals,
-          reason: `R:R Filter: Stop too far (${stopPct.toFixed(2)}% > 1.5%)`,
-          mlPrediction: 0.5,
-        };
-      }
+      // 4. MACD confirmation (bonus, not required)
+      const hasMacdConfirm = isLong
+        ? (m5.macdBullishCross || m5.macdHistogram > 0)
+        : (m5.macdBearishCross || m5.macdHistogram < 0);
+      if (hasMacdConfirm) signals.push('MACD✓');
 
       // ML prediction (optional)
       let mlPrediction = 0.5;
@@ -1622,25 +1668,22 @@ class CoinTrader {
         signals.push(`ML:${(mlPrediction * 100).toFixed(0)}%`);
       }
 
-      // NO kill zone bonus - data shows KZ hurts performance (7.9% vs 16.9% win rate)
       return {
         shouldEnter: true,
         direction,
-        strength: Math.min(1, strength + (nearEma ? 0.1 : 0) + (nearVwap ? 0.1 : 0) + (williamsConfirm ? 0.1 : 0)),
+        strength: Math.min(1, strength + (hasMacdConfirm ? 0.1 : 0)),
         signals,
-        reason: `TREND ${direction} (pullback:${nearEma ? 'EMA' : 'VWAP'}+MACD+VOL)`,
+        reason: `MOMENTUM ${direction} (breakout+VOL+EMA)`,
         mlPrediction,
       };
 
     } else {
       // ═══════════════════════════════════════════════════════════════
-      // RANGE MODE: Mean reversion at tighter BB extremes (25%/75%)
-      // Direction is OVERRIDDEN by BB position (mean reversion logic):
-      //   BB < 25% → LONG (buy oversold), BB > 75% → SHORT (sell overbought)
-      // Middle zone (25-75%) → skip, no edge
+      // RANGE MODE: Mean reversion (ADX < 20 + BB normal)
+      // Entry: At BB extremes, look for reversal
+      // Exit: TP1 = Middle BB (70%), TP2 = Opposite BB (30%)
       // ═══════════════════════════════════════════════════════════════
-
-      // Override direction based on BB position for mean reversion (tighter thresholds)
+      // Override direction based on BB position for mean reversion
       let rangeDirection: 'LONG' | 'SHORT' | 'SKIP' = 'SKIP';
       if (bbPos < CONFIG.regime.rangeLongThreshold) {  // < 25%
         rangeDirection = 'LONG';
@@ -1659,53 +1702,143 @@ class CoinTrader {
         };
       }
 
+      // ═══════════════════════════════════════════════════════════════
+      // OFI FILTER - Order Flow Imbalance at BB extremes (optional)
+      // Only filter if we have actual OFI data (not default 0)
+      // ═══════════════════════════════════════════════════════════════
+      const ofi = m5.ofi || 0;
+      const hasOfiData = m5.ofi !== undefined && m5.ofi !== 0;
+      const ofiThreshold = 0.3;
+
+      if (hasOfiData) {
+        if (rangeDirection === 'LONG' && ofi < ofiThreshold) {
+          return {
+            shouldEnter: false,
+            direction: rangeDirection,
+            strength,
+            signals,
+            reason: `RANGE: OFI ${ofi.toFixed(2)} < ${ofiThreshold} - no buying pressure at lower BB`,
+            mlPrediction: 0.5,
+          };
+        }
+        if (rangeDirection === 'SHORT' && ofi > -ofiThreshold) {
+          return {
+            shouldEnter: false,
+            direction: rangeDirection,
+            strength,
+            signals,
+            reason: `RANGE: OFI ${ofi.toFixed(2)} > -${ofiThreshold} - no selling pressure at upper BB`,
+            mlPrediction: 0.5,
+          };
+        }
+        signals.push(`OFI:${ofi > 0 ? '+' : ''}${ofi.toFixed(2)}`);
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // BAND WALK DETECTION: Check last 2 candles
+      // If price closed in extreme zone for 2+ candles = walking, not reversing
+      // SOFT FILTER: Reduce size instead of blocking
+      // ═══════════════════════════════════════════════════════════════
+      const candles = tf5m.candles;
+      if (candles.length >= 3) {
+        // Check if last 2 closes were both in extreme zone (bottom 30% or top 30% of candle)
+        if (rangeDirection === 'LONG') {
+          // Looking to buy at lower band - check if walking down
+          const last2 = candles.slice(-2);
+          const bothNearLow = last2.every(c => {
+            const range = c.high - c.low;
+            const position = range > 0 ? (c.close - c.low) / range : 0.5;
+            return position < 0.3; // Closed in bottom 30% of candle
+          });
+          if (bothNearLow) {
+            // Soft filter: reduce size, don't block
+            strength *= 0.5;
+            signals.push('WALK⚠');
+          }
+        } else if (rangeDirection === 'SHORT') {
+          // Looking to sell at upper band - check if walking up
+          const last2 = candles.slice(-2);
+          const bothNearHigh = last2.every(c => {
+            const range = c.high - c.low;
+            const position = range > 0 ? (c.close - c.low) / range : 0.5;
+            return position > 0.7; // Closed in top 30% of candle
+          });
+          if (bothNearHigh) {
+            // Soft filter: reduce size, don't block
+            strength *= 0.5;
+            signals.push('WALK⚠');
+          }
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // 4H TREND CHECK - SOFT (already applied trendMultiplier earlier)
+      // Counter-trend mean reversion allowed with smaller size
+      // ═══════════════════════════════════════════════════════════════
+      // Signal already added in initial 4H filter section
+
       // Use mean reversion direction instead of momentum direction
       const direction_override = rangeDirection as 'LONG' | 'SHORT';
       const isLong = direction_override === 'LONG';
 
-      // Require volume spike for RANGE entries - the ONLY profitable filter from historical data
-      if (!m5.volumeSpike) {
+      // ═══════════════════════════════════════════════════════════════
+      // CANDLE CONFIRMATION - SOFT (reduce size, don't block)
+      // ═══════════════════════════════════════════════════════════════
+      const candleTurning = isLong
+        ? (m5.candleMomentum === 'bullish')
+        : (m5.candleMomentum === 'bearish');
+
+      if (!candleTurning) {
+        // Reduce size instead of blocking entirely
+        strength *= 0.5;
+        signals.push('CANDLE⚠');
+      } else {
+        signals.push('CANDLE✓');
+      }
+      signals.push(`BB:${(bbPos * 100).toFixed(0)}%`);
+
+      // Volume spike REQUIRED (1.5x for RANGE mode, but NOT 3x+ exhaustion)
+      const volumeThreshold = CONFIG.momentum.volumeSpikeMultipleRange;  // 1.5x
+      const isExhaustion = m5.volumeRatio > 3.0;  // 3x+ = exhaustion spike, skip
+
+      if (isExhaustion) {
         return {
           shouldEnter: false,
           direction: direction_override,
           strength,
           signals,
+          reason: `RANGE: Volume exhaustion (${m5.volumeRatio.toFixed(1)}x > 3x) - skip`,
           mlPrediction: 0.5,
-          reason: `RANGE: ${direction_override} needs volume spike (BB:${(bbPos * 100).toFixed(0)}%)`
         };
       }
-      signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x`);
 
-      // Williams %R confirmation (should be at extreme for mean reversion)
+      if (m5.volumeRatio < volumeThreshold) {
+        // Soft filter: reduce size but don't block (data collection)
+        strength *= 0.6;
+        signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x<${volumeThreshold}`);
+      } else {
+        signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x`);
+      }
+
+      // Williams %R confirmation (bonus signal)
       const williamsAtExtreme = isLong
         ? (m5.williamsROversold || m5.williamsR < -80)
         : (m5.williamsROverbought || m5.williamsR > -20);
       if (williamsAtExtreme) signals.push('W%R✓');
 
-      // Price turning confirmation (candle should show reversal)
-      const candleTurning = isLong
-        ? (m5.candleMomentum === 'bullish')
-        : (m5.candleMomentum === 'bearish');
-      if (candleTurning) signals.push('CANDLE✓');
-
       // ═══════════════════════════════════════════════════════════════
-      // R:R FILTER for RANGE mode (same as TREND)
+      // R:R FILTER for RANGE mode - SOFT (reduce size, don't block)
       // ═══════════════════════════════════════════════════════════════
       const currentPrice = tf5m.candles[tf5m.candles.length - 1].close;
       const atrStopDistance = (m5.atr || currentPrice * 0.005) * 1.5;
-      const maxStopDistance = currentPrice * 0.015;
+      const maxStopDistance = currentPrice * 0.01;  // 1% max (matches TP1)
       const estimatedStopDistance = Math.min(atrStopDistance, maxStopDistance);
       const stopPct = (estimatedStopDistance / currentPrice) * 100;
 
-      if (stopPct > 1.5) {
-        return {
-          shouldEnter: false,
-          direction: direction_override,
-          strength,
-          signals,
-          mlPrediction: 0.5,
-          reason: `RANGE: Stop too far (${stopPct.toFixed(2)}% > 1.5%)`
-        };
+      if (stopPct > 1.0) {
+        // Soft filter: reduce size for wider stops
+        strength *= 0.5;
+        signals.push(`SL:${stopPct.toFixed(1)}%`);
       }
 
       // NO kill zone bonus - data shows KZ hurts performance
@@ -1745,8 +1878,8 @@ class CoinTrader {
     let stopDistance = atr5m * 1.5;
     let stopLoss = isLong ? currentPrice - stopDistance : currentPrice + stopDistance;
 
-    // Safety: Cap ATR stop at max 1.5% (prevent huge stops in extreme volatility)
-    const maxStopPct = 1.5;
+    // Safety: Cap ATR stop at max 1.0% (matches TP1 for 1:1 R:R minimum)
+    const maxStopPct = 1.0;
     const stopPct = (stopDistance / currentPrice) * 100;
     if (stopPct > maxStopPct) {
       stopDistance = currentPrice * (maxStopPct / 100);
@@ -1797,42 +1930,22 @@ class CoinTrader {
 
 
     // ═══════════════════════════════════════════════════════════════
-    // STRUCTURE-AWARE TPs: Snap to nearby structural levels/round numbers
-    // Hybrid approach: R:R sets the floor, structure sets the target
+    // BB-BASED TARGETS: Mean reversion scalping
+    // TP1 = Middle BB (70% close), TP2 = Opposite BB (30% close)
     // ═══════════════════════════════════════════════════════════════
 
-    // Find structural TP targets from 15m swing points
-    const structuralLow = momentum15m?.swingLow || momentum5m?.swingLow || null;
-    const structuralHigh = momentum15m?.swingHigh || momentum5m?.swingHigh || null;
+    // Get BB values from 5m momentum
+    const bbMiddle = momentum5m?.bbMiddle || currentPrice;
+    const bbUpper = momentum5m?.bbUpper || currentPrice * 1.01;
+    const bbLower = momentum5m?.bbLower || currentPrice * 0.99;
 
-    // Find nearest round number in the TP direction
-    const findNearestRound = (price: number, direction: 'above' | 'below'): number => {
-      // Round number intervals scale with price magnitude
-      // BTC ~96000: round to 500/1000, ETH ~3000: round to 50/100, small alts: round to 0.01/0.1
-      let interval: number;
-      if (price > 10000) interval = 500;
-      else if (price > 1000) interval = 100;
-      else if (price > 100) interval = 10;
-      else if (price > 10) interval = 1;
-      else if (price > 1) interval = 0.1;
-      else interval = 0.01;
+    // TP1 = Middle BB (mean reversion target)
+    // TP2 = Opposite BB band (full reversal target)
+    const takeProfit1 = bbMiddle;  // Middle BB
+    const takeProfit2 = isLong ? bbUpper : bbLower;  // Opposite band
 
-      if (direction === 'below') {
-        return Math.floor(price / interval) * interval;
-      } else {
-        return Math.ceil(price / interval) * interval;
-      }
-    };
-
-    // FIXED % TARGETS for true scalping - quick in and out!
-    // TP levels are fixed percentages for consistent scalping
-    const tp1Distance = currentPrice * (CONFIG.targets.tp1Pct / 100);   // 0.5%
-    const tp2Distance = currentPrice * (CONFIG.targets.tp2Pct / 100);   // 1.0%
-    const tp3Distance = currentPrice * (CONFIG.targets.tp3Pct / 100);   // 1.5%
-
-    const takeProfit1 = isLong ? currentPrice + tp1Distance : currentPrice - tp1Distance;
-    const takeProfit2 = isLong ? currentPrice + tp2Distance : currentPrice - tp2Distance;
-    const takeProfit3 = isLong ? currentPrice + tp3Distance : currentPrice - tp3Distance;
+    // R = TP1 distance (not SL distance!) - used for all post-TP1 calculations
+    const tp1DistanceR = Math.abs(takeProfit1 - currentPrice);
 
     // ═══════════════════════════════════════════════════════════════
     // KELLY CRITERION POSITION SIZING
@@ -1840,8 +1953,7 @@ class CoinTrader {
     // ═══════════════════════════════════════════════════════════════
 
     // Calculate R:R based on actual stop and TP1 distance
-    const tp1ActualDistance = Math.abs(takeProfit1 - currentPrice);
-    const rRatio = tp1ActualDistance / stopDistance;  // R:R ratio
+    const rRatio = tp1DistanceR / stopDistance;  // R:R ratio
 
     // Use ML prediction as win probability, fallback to conservative 0.4
     const mlWinProb = 0.4;  // Conservative fallback since we don't have ML in this context
@@ -1902,6 +2014,9 @@ class CoinTrader {
     const notional = fillPrice * positionSize;
     const entryFee = notional * CONFIG.takerFeeRate;
 
+    // Determine if MOMENTUM mode (breakout trade with trailing only)
+    const isMomentumMode = momentum5m?.regime === 'MOMENTUM';
+
     const trade: PaperTrade = {
       id: `${this.state.symbol}-${Date.now()}`,
       symbol: this.state.symbol,
@@ -1910,16 +2025,17 @@ class CoinTrader {
       entryTime: Date.now(),
       stopLoss,
       originalStopLoss: stopLoss,
+      tp1DistanceR: isMomentumMode ? stopDistance : tp1DistanceR,  // MOMENTUM: R = stop distance
       takeProfit1,
       takeProfit2,
-      takeProfit3,
+      isMomentumMode,              // MOMENTUM = trail only, RANGE = TP1/TP2
       trailingStop: null,
       originalPositionSize: positionSize,
       currentPositionSize: positionSize,
-      tp1Hit: false,
-      tp2Hit: false,
-      tp3Hit: false,
-      stopLossMovedToBreakeven: false,
+      candlesHeld: 0,            // Track for time stop
+      tp1Hit: isMomentumMode,    // MOMENTUM: skip TP1 logic entirely
+      tp2Hit: isMomentumMode,    // MOMENTUM: skip TP2 logic entirely
+      phase2Active: false,       // Phase 2 trailing active
       status: 'OPEN',
       feesPaid: entryFee,
       momentumStrength: analysis.strength,
@@ -1939,9 +2055,21 @@ class CoinTrader {
     // Calculate final risk % for logging
     const riskPct = (stopDistance / currentPrice) * 100;
 
-    console.log(`\n⚡ ${this.state.symbol}: SCALP ${trade.direction} [${swingSource}]`);
-    console.log(`   Entry: $${fillPrice.toFixed(4)} | SL: $${stopLoss.toFixed(4)} (${riskPct.toFixed(2)}% risk)`);
-    console.log(`   TP1: $${takeProfit1.toFixed(4)} (${CONFIG.targets.tp1Pct}%) | TP2: $${takeProfit2.toFixed(4)} (${CONFIG.targets.tp2Pct}%) | TP3: $${takeProfit3.toFixed(4)} (${CONFIG.targets.tp3Pct}%)`);
+    if (isMomentumMode) {
+      // MOMENTUM mode: Trail only, no fixed TPs
+      console.log(`\n🚀 ${this.state.symbol}: MOMENTUM ${trade.direction} [${swingSource}]`);
+      console.log(`   Entry: $${fillPrice.toFixed(4)} | SL: $${stopLoss.toFixed(4)} (${riskPct.toFixed(2)}% risk)`);
+      console.log(`   Mode: TRAIL ONLY - Trail at -${CONFIG.targets.momentumTrailR}R after ${CONFIG.targets.momentumTrailAfterR}R profit`);
+      console.log(`   Time stop: ${CONFIG.targets.timeStopCandles} candles`);
+    } else {
+      // RANGE mode: Mean reversion with TP1/TP2
+      const tp1Pct = ((takeProfit1 - fillPrice) / fillPrice * 100).toFixed(2);
+      const tp2Pct = Math.abs(((takeProfit2 - fillPrice) / fillPrice * 100)).toFixed(2);
+      console.log(`\n⚡ ${this.state.symbol}: RANGE ${trade.direction} [${swingSource}]`);
+      console.log(`   Entry: $${fillPrice.toFixed(4)} | SL: $${stopLoss.toFixed(4)} (${riskPct.toFixed(2)}% risk)`);
+      console.log(`   TP1: $${takeProfit1.toFixed(4)} (Middle BB ${tp1Pct}%) | TP2: $${takeProfit2.toFixed(4)} (Opposite BB ${tp2Pct}%)`);
+      console.log(`   Split: 70% at TP1, 30% at TP2 | Time stop: ${CONFIG.targets.timeStopCandles} candles`);
+    }
     console.log(`   Signals: ${analysis.signals.join(', ')}`);
     console.log(`   Strength: ${(analysis.strength * 100).toFixed(0)}% | Size: ${positionSize.toFixed(4)}`);
   }
@@ -1949,6 +2077,9 @@ class CoinTrader {
   private checkOpenTrade(currentPrice: number, candleLow: number = currentPrice, candleHigh: number = currentPrice): { closed: boolean; message: string } {
     const trade = this.state.openTrade!;
     const isLong = trade.direction === 'LONG';
+
+    // Increment candle counter for time stop
+    trade.candlesHeld++;
 
     const priceDiff = isLong ? currentPrice - trade.entryPrice : trade.entryPrice - currentPrice;
     const pnlPercent = (priceDiff / trade.entryPrice) * 100;
@@ -1962,10 +2093,32 @@ class CoinTrader {
       return { closed: true, message: 'Position closed (flat)' };
     }
 
-    // Check timeout
+    // ═══════════════════════════════════════════════════════════════
+    // TREND REVERSAL FLASH CLOSE - Lock profits when trend turns
+    // ═══════════════════════════════════════════════════════════════
+    const tf4h = this.state.timeframes.get('4h');
+    const m4h = tf4h?.momentum;
+
+    if (m4h && pnlPercent > 0.2) {  // Only flash close if profitable > 0.2%
+      const trendReversed = isLong
+        ? m4h.emaAligned === 'bearish'  // LONG but 4h turned bearish
+        : m4h.emaAligned === 'bullish'; // SHORT but 4h turned bullish
+
+      if (trendReversed) {
+        return this.closeTrade(currentPrice, 'TREND_REVERSAL', pnl, pnlPercent);
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // TIME STOP - Exit remaining after N candles
+    // ═══════════════════════════════════════════════════════════════
+    if (trade.candlesHeld >= CONFIG.targets.timeStopCandles) {
+      return this.closeTrade(currentPrice, 'TIMEOUT', pnl, pnlPercent);
+    }
+
+    // Also check minute-based timeout for very long holds
     const holdTime = Date.now() - trade.entryTime;
     const maxHoldMs = CONFIG.maxHoldMinutes * 60 * 1000;
-
     if (holdTime > maxHoldMs) {
       return this.closeTrade(currentPrice, 'TIMEOUT', pnl, pnlPercent);
     }
@@ -1988,75 +2141,131 @@ class CoinTrader {
       }
     }
 
-    // Check TP1 (33% close) - use candle extreme to catch wicks
+    // ═══════════════════════════════════════════════════════════════
+    // MOMENTUM MODE: Trail at -1R from entry (no fixed TPs)
+    // ═══════════════════════════════════════════════════════════════
+    if (trade.isMomentumMode) {
+      // Calculate profit in R (R = stop distance for momentum mode)
+      const profitR = priceDiff / trade.tp1DistanceR;
+
+      // Start trailing after momentumTrailAfterR (0.5R) profit
+      if (profitR >= CONFIG.targets.momentumTrailAfterR) {
+        if (!trade.phase2Active) {
+          trade.phase2Active = true;
+          console.log(`   ${trade.symbol}: MOMENTUM trailing ACTIVE at ${profitR.toFixed(2)}R profit`);
+        }
+
+        // Trail at momentumTrailR (1.0R) from current price
+        const trailDistance = CONFIG.targets.momentumTrailR * trade.tp1DistanceR;
+        const newTrailing = isLong ? currentPrice - trailDistance : currentPrice + trailDistance;
+
+        // Only tighten (never loosen), AND must be better than current SL
+        if (trade.trailingStop === null ||
+            (isLong && newTrailing > trade.trailingStop) ||
+            (!isLong && newTrailing < trade.trailingStop)) {
+          trade.trailingStop = newTrailing;
+        }
+      }
+
+      const trailInfo = trade.trailingStop ? ` TRAIL:$${trade.trailingStop.toFixed(4)}` : '';
+      const candleInfo = ` C${trade.candlesHeld}/${CONFIG.targets.timeStopCandles}`;
+      const profitRInfo = ` (${profitR.toFixed(2)}R)`;
+      return {
+        closed: false,
+        message: `MOMENTUM${trade.phase2Active ? ' [TRAILING]' : ' [HOLD]'}${trailInfo}${candleInfo}${profitRInfo} | PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`
+      };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // RANGE MODE: TP1/TP2 mean reversion
+    // TP1: Middle BB - Close 70%, Move SL to Entry + 0.2R
+    // ═══════════════════════════════════════════════════════════════
     if (!trade.tp1Hit) {
       if ((isLong && tpCheckPrice >= trade.takeProfit1) || (!isLong && tpCheckPrice <= trade.takeProfit1)) {
         trade.tp1Hit = true;
-        const closeAmount = trade.originalPositionSize * CONFIG.targets.tp1ClosePct;
-        this.closePartialTrade(currentPrice, closeAmount, 'TP1');
-        // Move stop to breakeven
-        trade.stopLoss = trade.entryPrice;
-        trade.stopLossMovedToBreakeven = true;
+        const closeAmount = trade.originalPositionSize * CONFIG.targets.tp1ClosePct;  // 70%
+        // IMPORTANT: Close at TP1 price, not current price (wick may have retracted)
+        this.closePartialTrade(trade.takeProfit1, closeAmount, 'TP1');
+
+        // Move SL to Entry + 0.2R where R = (tp1 - entry)
+        const protectedSlDistance = trade.tp1DistanceR * CONFIG.targets.protectedProfitR;  // 0.2R
+        trade.stopLoss = isLong
+          ? trade.entryPrice + protectedSlDistance
+          : trade.entryPrice - protectedSlDistance;
 
         // Recalculate PnL after partial close for accurate display
         const newPriceDiff = isLong ? currentPrice - trade.entryPrice : trade.entryPrice - currentPrice;
         const newPnl = newPriceDiff * trade.currentPositionSize;
         const newPnlPercent = (newPriceDiff / trade.entryPrice) * 100;
 
-        return { closed: false, message: `TP1 HIT (+${(CONFIG.targets.tp1ClosePct * 100).toFixed(0)}%) | SL→BE | PnL: ${newPnlPercent >= 0 ? '+' : ''}${newPnlPercent.toFixed(2)}%` };
+        return { closed: false, message: `TP1 HIT (+70%) | SL→+0.2R | PnL: ${newPnlPercent >= 0 ? '+' : ''}${newPnlPercent.toFixed(2)}%` };
       }
     }
 
-    // Check TP2 (33% close) - use candle extreme
+    // ═══════════════════════════════════════════════════════════════
+    // TP2: Opposite BB - Close remaining 30%
+    // ═══════════════════════════════════════════════════════════════
     if (!trade.tp2Hit && trade.tp1Hit) {
       if ((isLong && tpCheckPrice >= trade.takeProfit2) || (!isLong && tpCheckPrice <= trade.takeProfit2)) {
         trade.tp2Hit = true;
-        const closeAmount = trade.originalPositionSize * CONFIG.targets.tp2ClosePct;
-        this.closePartialTrade(currentPrice, closeAmount, 'TP2');
-
-        // Recalculate PnL after partial close
-        const newPriceDiff = isLong ? currentPrice - trade.entryPrice : trade.entryPrice - currentPrice;
-        const newPnl = newPriceDiff * trade.currentPositionSize;
-        const newPnlPercent = (newPriceDiff / trade.entryPrice) * 100;
-
-        return { closed: false, message: `TP2 HIT (+${(CONFIG.targets.tp2ClosePct * 100).toFixed(0)}%) | PnL: ${newPnlPercent >= 0 ? '+' : ''}${newPnlPercent.toFixed(2)}%` };
-      }
-    }
-
-    // Check TP3 (final 34% close) - use candle extreme
-    if (!trade.tp3Hit && trade.tp2Hit) {
-      if ((isLong && tpCheckPrice >= trade.takeProfit3) || (!isLong && tpCheckPrice <= trade.takeProfit3)) {
-        trade.tp3Hit = true;
         const closeAmount = trade.currentPositionSize; // Close remaining
-        this.closePartialTrade(currentPrice, closeAmount, 'TP3');
+        this.closePartialTrade(trade.takeProfit2, closeAmount, 'TP2');
         trade.status = 'CLOSED';
         this.state.openTrade = null;
         this.saveState();
-        return { closed: true, message: `TP3 HIT (closed)` };
+        return { closed: true, message: `TP2 HIT (+30%) - Full exit` };
       }
     }
 
-    // Update trailing stop after TP1 hit
-    if (trade.tp1Hit) {
-      const trailDistance = currentPrice * (CONFIG.targets.trailingDistancePct / 100);
-      const newTrailing = isLong ? currentPrice - trailDistance : currentPrice + trailDistance;
+    // ═══════════════════════════════════════════════════════════════
+    // PHASE 2 TRAILING - Activate when price near TP2
+    // Trigger: current >= tp2 - 0.3 * (tp2 - entry) = at 70% of TP2 distance
+    // Trail: current - 0.5 * (tp1 - entry) = -0.5R from current
+    // ═══════════════════════════════════════════════════════════════
+    if (trade.tp1Hit && !trade.tp2Hit) {
+      // Calculate trigger price: tp2 - 0.3 * (tp2 - entry)
+      const tp2Distance = Math.abs(trade.takeProfit2 - trade.entryPrice);
+      const phase2TriggerPrice = isLong
+        ? trade.takeProfit2 - 0.3 * tp2Distance
+        : trade.takeProfit2 + 0.3 * tp2Distance;
 
-      if (trade.trailingStop === null ||
-          (isLong && newTrailing > trade.trailingStop) ||
-          (!isLong && newTrailing < trade.trailingStop)) {
-        trade.trailingStop = newTrailing;
+      // Check if we should activate phase 2
+      const shouldActivatePhase2 = isLong
+        ? currentPrice >= phase2TriggerPrice
+        : currentPrice <= phase2TriggerPrice;
+
+      if (shouldActivatePhase2 && !trade.phase2Active) {
+        trade.phase2Active = true;
+        const tp2R = tp2Distance / trade.tp1DistanceR;
+        console.log(`   ${trade.symbol}: Phase 2 trailing ACTIVE (TP2 at ${tp2R.toFixed(2)}R)`);
+      }
+
+      // Apply trailing when phase 2 is active
+      if (trade.phase2Active) {
+        // Trail at -0.5R from current price where R = (tp1 - entry)
+        const trailDistance = CONFIG.targets.phase2TrailR * trade.tp1DistanceR;  // 0.5R
+        const newTrailing = isLong ? currentPrice - trailDistance : currentPrice + trailDistance;
+
+        // Only tighten (never loosen), AND must be better than current SL
+        if (trade.trailingStop === null ||
+            (isLong && newTrailing > trade.trailingStop) ||
+            (!isLong && newTrailing < trade.trailingStop)) {
+          trade.trailingStop = newTrailing;
+        }
       }
     }
 
     const tpStatus = [trade.tp1Hit ? 'TP1' : '', trade.tp2Hit ? 'TP2' : ''].filter(Boolean).join('+') || 'HOLD';
+    const phaseInfo = trade.phase2Active ? ' [P2-TRAIL]' : '';
     const trailInfo = trade.trailingStop ? ` TRAIL:$${trade.trailingStop.toFixed(4)}` : '';
+    const candleInfo = ` C${trade.candlesHeld}/${CONFIG.targets.timeStopCandles}`;
     return {
       closed: false,
-      message: `${tpStatus}${trailInfo} | PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`
+      message: `${tpStatus}${phaseInfo}${trailInfo}${candleInfo} | PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`
     };
   }
 
-  private closePartialTrade(exitPrice: number, closeAmount: number, reason: 'TP1' | 'TP2' | 'TP3'): void {
+  private closePartialTrade(exitPrice: number, closeAmount: number, reason: 'TP1' | 'TP2'): void {
     const trade = this.state.openTrade!;
     const isLong = trade.direction === 'LONG';
 
@@ -2146,16 +2355,42 @@ class CoinTrader {
 
     if (finalPnl > 0) {
       this.state.stats.wins++;
+      // Track consecutive wins (for overconfidence check)
+      this.state.consecutiveWins++;
+      this.state.consecutiveLosses = 0;  // Reset loss streak
     } else {
       this.state.stats.losses++;
+      // Track consecutive losses (for scraper timeout)
+      this.state.consecutiveLosses++;
+      this.state.consecutiveWins = 0;  // Reset win streak
     }
 
     this.state.stats.winRate = this.state.stats.totalTrades > 0
       ? (this.state.stats.wins / this.state.stats.totalTrades) * 100
       : 0;
 
-    // Set cooldown
-    this.state.cooldownUntil = Date.now() + CONFIG.cooldownMs;
+    // ═══════════════════════════════════════════════════════════════
+    // SCRAPER TIMEOUT - Prevent tilt and overconfidence
+    // ═══════════════════════════════════════════════════════════════
+    let cooldownExtra = 0;
+    let timeoutReason = '';
+
+    // 3 consecutive losses = 30 min break (prevent tilt)
+    if (this.state.consecutiveLosses >= CONFIG.maxConsecutiveLosses) {
+      cooldownExtra = CONFIG.consecutiveLossCooldownMs - CONFIG.cooldownMs;  // Add extra time
+      timeoutReason = ` | ⚠️ ${this.state.consecutiveLosses} losses = 30min break`;
+      console.log(`   🛑 SCRAPER TIMEOUT: ${this.state.consecutiveLosses} consecutive losses - taking 30 min break`);
+    }
+
+    // 5 consecutive wins = 10 min break (prevent overconfidence)
+    if (this.state.consecutiveWins >= CONFIG.maxConsecutiveWins) {
+      cooldownExtra = CONFIG.consecutiveWinsCooldownMs - CONFIG.cooldownMs;  // 10 min
+      timeoutReason = ` | ⏸️ ${this.state.consecutiveWins} wins = 10min cooloff`;
+      console.log(`   ⏸️ OVERCONFIDENCE CHECK: ${this.state.consecutiveWins} consecutive wins - taking 10 min break`);
+    }
+
+    // Set cooldown (normal + any extra)
+    this.state.cooldownUntil = Date.now() + CONFIG.cooldownMs + cooldownExtra;
 
     this.state.openTrade = null;
     this.saveState();
@@ -2163,12 +2398,13 @@ class CoinTrader {
     const emoji = finalPnl > 0 ? '✅' : '❌';
     const pnlSign = finalPnl >= 0 ? '+' : '';
     const holdMins = Math.round((trade.exitTime - trade.entryTime) / 60000);
+    const candles = trade.candlesHeld || 0;
 
     console.log(`\n${emoji} ${this.state.symbol}: CLOSED ${reason}`);
     console.log(`   PnL: ${pnlSign}$${finalPnl.toFixed(2)} (${pnlSign}${finalPnlPercent.toFixed(2)}%)`);
-    console.log(`   Held: ${holdMins}m | Fees: $${trade.feesPaid.toFixed(2)}`);
+    console.log(`   Held: ${holdMins}m (${candles} candles) | Fees: $${trade.feesPaid.toFixed(2)}`);
     console.log(`   Stats: ${this.state.stats.wins}W/${this.state.stats.losses}L (${this.state.stats.winRate.toFixed(1)}%)`);
-    console.log(`   Balance: $${this.state.balance.toFixed(2)}\n`);
+    console.log(`   Balance: $${this.state.balance.toFixed(2)}${timeoutReason}\n`);
 
     return { closed: true, message: `${reason} ${pnlSign}${finalPnlPercent.toFixed(2)}%` };
   }
@@ -2183,7 +2419,7 @@ async function main() {
   console.log('     STRUCTURE-BASED SCALPER - Paper Trading');
   console.log('═══════════════════════════════════════════════════════════════');
   console.log(`Mode: ${CONFIG.mode}`);
-  console.log(`Dual Mode: TREND (breakouts) / RANGE (BB reversion)`);
+  console.log(`Regime Mode: MOMENTUM (breakouts+trail) / RANGE (BB reversion) / NONE (skip)`);
   console.log(`Primary TF: ${CONFIG.primaryInterval}`);
   console.log(`STOPS: STRUCTURE-BASED (swing high/low, max 2% risk)`);
   console.log(`TARGET: Middle Bollinger Band (min 1.5:1 R:R)`);
@@ -2342,24 +2578,50 @@ function writeLiveSummary(
   // Helper for price display
   const getDecimalPlaces = (p: number): number => {
     if (p >= 1000) return 2;
+    if (p >= 1000) return 2;
     if (p >= 100) return 2;
     if (p >= 10) return 3;
     if (p >= 1) return 4;
     return 5;
   };
 
+  // Daily trade limit tracking (quality over quantity)
+  let dailyTradeCount = 0;
+  let dailyTradeDate = new Date().toDateString();
+
   // Main loop
   let iteration = 0;
+  let headerPrinted = false;
 
   while (true) {
     iteration++;
-    const now = new Date().toLocaleTimeString();
+    const now = new Date();
+    const nowStr = now.toLocaleTimeString();
+    const todayDate = now.toDateString();
 
-    // Clear screen and show header
-    process.stdout.write('\x1B[2J\x1B[0f');
-    console.log('\n╔═══════════════════════════════════════════════════════════════╗');
-    console.log(`║  DUAL-MODE SCALPER - Cycle: ${iteration} | ${now}            ║`);
-    console.log('╚═══════════════════════════════════════════════════════════════╝\n');
+    // Reset daily counter at midnight
+    if (todayDate !== dailyTradeDate) {
+      dailyTradeCount = 0;
+      dailyTradeDate = todayDate;
+      console.log(`\n📅 New day - trade counter reset`);
+    }
+
+    // Show header only once at startup
+    if (!headerPrinted) {
+      console.log('\n╔═══════════════════════════════════════════════════════════════╗');
+      console.log(`║  REGIME SCALPER - MOMENTUM/RANGE/NONE                          ║`);
+      console.log('╚═══════════════════════════════════════════════════════════════╝\n');
+      headerPrinted = true;
+    }
+
+    // Small cycle marker each iteration
+    console.log(`\n🔄 SCALP Cycle ${iteration} | ${nowStr} | Daily trades: ${dailyTradeCount}/${CONFIG.maxDailyTrades}`);
+
+    // Daily trade limit check - quality over quantity
+    const dailyLimitReached = dailyTradeCount >= CONFIG.maxDailyTrades;
+
+    // Count current open positions (for display only)
+    const currentOpenCount = traders.filter(t => t.state.openTrade).length;
 
     // Process each trader and collect results
     const results: Array<{ symbol: string; price: number; result: any; trader: typeof traders[0] }> = [];
@@ -2368,7 +2630,26 @@ function writeLiveSummary(
       try {
         const tf5m = trader.state.timeframes.get('5m');
         const price = tf5m?.candles?.length ? tf5m.candles[tf5m.candles.length - 1].close : 0;
+
+        // Skip new entries if daily limit reached
+        if (dailyLimitReached && !trader.state.openTrade) {
+          results.push({
+            symbol: trader.state.symbol,
+            price,
+            result: { status: 'DAILY_LIMIT', details: `Max ${CONFIG.maxDailyTrades} trades/day reached` },
+            trader
+          });
+          continue;
+        }
+
+        const hadOpenTrade = !!trader.state.openTrade;
         const result = await trader.tick(client);
+
+        // Count new entries (trade opened this tick)
+        if (!hadOpenTrade && trader.state.openTrade) {
+          dailyTradeCount++;
+        }
+
         results.push({ symbol: trader.state.symbol, price, result, trader });
       } catch (e: any) {
         results.push({
@@ -2402,10 +2683,10 @@ function writeLiveSummary(
         // TP hit indicators
         const tp1 = trade.tp1Hit ? '✓' : ' ';
         const tp2 = trade.tp2Hit ? '✓' : ' ';
-        const tp3 = trade.tp3Hit ? '✓' : ' ';
 
         const currentPriceDisplay = price > 0 ? `$${price.toFixed(pricePrecision)}` : '$---';
-        console.log(`   ${symbol}: ${trade.direction} | ${currentPriceDisplay} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(2)}%) | TP: [${tp1}]$${trade.takeProfit1.toFixed(pricePrecision)} [${tp2}]$${trade.takeProfit2.toFixed(pricePrecision)} [${tp3}]$${trade.takeProfit3.toFixed(pricePrecision)} | SL:$${trade.stopLoss.toFixed(pricePrecision)}`);
+        const phaseInfo = trade.phase2Active ? ' [P2]' : '';
+        console.log(`   ${symbol}: ${trade.direction} | ${currentPriceDisplay} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(2)}%) | TP: [${tp1}]$${trade.takeProfit1.toFixed(pricePrecision)} [${tp2}]$${trade.takeProfit2.toFixed(pricePrecision)}${phaseInfo} | SL:$${trade.stopLoss.toFixed(pricePrecision)}`);
       }
     }
 
