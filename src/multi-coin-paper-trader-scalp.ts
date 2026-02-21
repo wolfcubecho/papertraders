@@ -1375,10 +1375,11 @@ class CoinTrader {
     const currentPrice = lastCandle.close;
     const candleLow = lastCandle.low;
     const candleHigh = lastCandle.high;
+    const candleTime = lastCandle.timestamp;
 
     // Check open trade
     if (this.state.openTrade) {
-      const result = this.checkOpenTrade(currentPrice, candleLow, candleHigh);
+      const result = this.checkOpenTrade(currentPrice, candleLow, candleHigh, candleTime);
       if (result.closed) {
         return { status: 'CLOSED', details: result.message };
       }
@@ -2074,12 +2075,16 @@ class CoinTrader {
     console.log(`   Strength: ${(analysis.strength * 100).toFixed(0)}% | Size: ${positionSize.toFixed(4)}`);
   }
 
-  private checkOpenTrade(currentPrice: number, candleLow: number = currentPrice, candleHigh: number = currentPrice): { closed: boolean; message: string } {
+  private checkOpenTrade(currentPrice: number, candleLow: number = currentPrice, candleHigh: number = currentPrice, currentCandleTime: number = 0): { closed: boolean; message: string } {
     const trade = this.state.openTrade!;
     const isLong = trade.direction === 'LONG';
 
-    // Increment candle counter for time stop
-    trade.candlesHeld++;
+    // Increment candle counter only when candle actually changes (not every check cycle)
+    // currentCandleTime is the timestamp of the current 5m candle
+    if (currentCandleTime > 0 && (trade as any).lastCandleTime !== currentCandleTime) {
+      trade.candlesHeld++;
+      (trade as any).lastCandleTime = currentCandleTime;
+    }
 
     const priceDiff = isLong ? currentPrice - trade.entryPrice : trade.entryPrice - currentPrice;
     const pnlPercent = (priceDiff / trade.entryPrice) * 100;
