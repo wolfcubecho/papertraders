@@ -2131,6 +2131,23 @@ class CoinTrader {
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // SAFETY CHECK: Ensure TPs are in correct direction
+    // If BB-based TPs are inverted (e.g., LONG entry above bbUpper),
+    // fall back to R-based targets to prevent losses
+    // ═══════════════════════════════════════════════════════════════
+    const tp1Correct = isLong ? takeProfit1 > currentPrice : takeProfit1 < currentPrice;
+    const tp2Correct = isLong ? takeProfit2 > currentPrice : takeProfit2 < currentPrice;
+
+    if (!tp1Correct || !tp2Correct) {
+      console.log(`   ⚠️ ${this.state.symbol}: TP direction mismatch! Falling back to R-based targets`);
+      console.log(`      Entry: $${currentPrice.toFixed(5)}, TP1: $${takeProfit1.toFixed(5)}, TP2: $${takeProfit2.toFixed(5)}`);
+      // Fall back to R-based targets
+      takeProfit1 = isLong ? currentPrice + stopDistance * 1.5 : currentPrice - stopDistance * 1.5;
+      takeProfit2 = isLong ? currentPrice + stopDistance * 3.0 : currentPrice - stopDistance * 3.0;
+      tp1DistanceR = stopDistance * 1.5;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // KELLY CRITERION POSITION SIZING
     // f* = (bp - q) / b where b = R:R, p = win prob, q = 1-p
     // ═══════════════════════════════════════════════════════════════
