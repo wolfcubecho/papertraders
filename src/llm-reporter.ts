@@ -4,7 +4,11 @@
  * Sends parameter analysis to GLM 5 API for intelligent recommendations.
  * Uses the same LLM that's running the trading system.
  *
- * Rate limited to max 1 call per hour to avoid costs/latency.
+ * HYBRID RATE LIMITING:
+ * - Min 4 hours between calls (avoid stale analysis in quiet markets)
+ * - Min 30 new trades since last call (need sample size)
+ * - Max 24 hours between calls (force analysis even in quiet markets)
+ *
  * NEVER auto-applies changes - logs suggestions only.
  */
 
@@ -20,7 +24,11 @@ export interface LLMConfig {
   model: string;               // Model name
   maxTokens: number;           // Max response tokens
   temperature: number;         // Creativity (0 = deterministic)
-  maxHourlyCalls: number;      // Rate limit
+
+  // Hybrid rate limiting (FIX: was trade-count only, now time + count)
+  minTimeBetweenCallsMs: number;  // Min 4 hours between calls
+  maxTimeBetweenCallsMs: number;  // Max 24 hours (force analysis)
+  minTradesForAnalysis: number;   // Min 30 trades for valid sample
 }
 
 export interface LLMRecommendation {
@@ -45,12 +53,16 @@ export interface LLMReport {
 // ─────────────────────────────────────────────────────────────────
 
 export const DEFAULT_LLM_CONFIG: LLMConfig = {
-  apiUrl: process.env.LLM_API_URL || 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+  apiUrl: process.env.LLM_API_URL || 'https://api.z.ai/api/paas/v4/chat/completions',
   apiKey: process.env.LLM_API_KEY || process.env.GLM_API_KEY || '',
   model: 'glm-4-flash',  // Fast, cheap model for parameter suggestions
   maxTokens: 1000,
   temperature: 0.3,       // Low temp for consistent recommendations
-  maxHourlyCalls: 1,      // Max 1 call per hour
+
+  // Hybrid rate limiting (FIXED)
+  minTimeBetweenCallsMs: 4 * 60 * 60 * 1000,   // 4 hours minimum
+  maxTimeBetweenCallsMs: 24 * 60 * 60 * 1000,  // 24 hours maximum (force)
+  minTradesForAnalysis: 30,                     // Need 30+ trades for valid sample
 };
 
 // ─────────────────────────────────────────────────────────────────
@@ -60,6 +72,7 @@ export const DEFAULT_LLM_CONFIG: LLMConfig = {
 export class LLMReporter {
   private config: LLMConfig;
   private lastCallTime: number = 0;
+  private lastCallTradeCount: number = 0;
   private callCount: number = 0;
   private enabled: boolean;
 
@@ -69,17 +82,56 @@ export class LLMReporter {
   }
 
   /**
-   * Check if we should make an LLM call (rate limited)
+   * HYBRID CHECK: Should we make an LLM call?
+   *
+   * Returns { shouldCall, reason } with detailed explanation
    */
-  shouldCall(): boolean {
-    if (!this.enabled) return false;
+  shouldCallWithReason(currentTradeCount: number): { shouldCall: boolean; reason: string } {
+    if (!this.enabled) {
+      return { shouldCall: false, reason: 'LLM not configured (no API key)' };
+    }
 
     const now = Date.now();
-    const hourMs = 60 * 60 * 1000;
     const timeSinceLastCall = now - this.lastCallTime;
+    const tradesSinceLastCall = currentTradeCount - this.lastCallTradeCount;
 
-    // Only allow if at least 1 hour has passed
-    return timeSinceLastCall >= (hourMs / this.config.maxHourlyCalls);
+    // FORCE: Must analyze at least every 24 hours (avoid stale analysis)
+    if (timeSinceLastCall >= this.config.maxTimeBetweenCallsMs) {
+      return {
+        shouldCall: true,
+        reason: `Forced analysis (${(timeSinceLastCall / 3600000).toFixed(1)}h since last call)`
+      };
+    }
+
+    // MIN TIME: Not enough time passed (need 4h minimum)
+    if (timeSinceLastCall < this.config.minTimeBetweenCallsMs) {
+      const hoursRemaining = (this.config.minTimeBetweenCallsMs - timeSinceLastCall) / 3600000;
+      return {
+        shouldCall: false,
+        reason: `Too soon (${hoursRemaining.toFixed(1)}h until next analysis)`
+      };
+    }
+
+    // MIN TRADES: Time OK but need sample size
+    if (tradesSinceLastCall < this.config.minTradesForAnalysis) {
+      return {
+        shouldCall: false,
+        reason: `Need more data (${tradesSinceLastCall}/${this.config.minTradesForAnalysis} new trades)`
+      };
+    }
+
+    // All conditions met: 4h+ passed AND 30+ new trades
+    return {
+      shouldCall: true,
+      reason: `Ready (${(timeSinceLastCall / 3600000).toFixed(1)}h passed, ${tradesSinceLastCall} new trades)`
+    };
+  }
+
+  /**
+   * Legacy method for backward compatibility
+   */
+  shouldCall(): boolean {
+    return this.shouldCallWithReason(0).shouldCall;
   }
 
   /**
@@ -87,10 +139,8 @@ export class LLMReporter {
    */
   getTimeUntilNextCall(): number {
     if (!this.enabled) return Infinity;
-    const hourMs = 60 * 60 * 1000;
-    const minInterval = hourMs / this.config.maxHourlyCalls;
     const elapsed = Date.now() - this.lastCallTime;
-    return Math.max(0, minInterval - elapsed);
+    return Math.max(0, this.config.minTimeBetweenCallsMs - elapsed);
   }
 
   /**
@@ -98,6 +148,14 @@ export class LLMReporter {
    */
   isEnabled(): boolean {
     return this.enabled;
+  }
+
+  /**
+   * Mark that analysis was performed
+   */
+  markAnalyzed(currentTradeCount: number): void {
+    this.lastCallTime = Date.now();
+    this.lastCallTradeCount = currentTradeCount;
   }
 
   /**

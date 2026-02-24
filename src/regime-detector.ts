@@ -28,7 +28,7 @@ export interface CoinRegimeSignals {
 export interface PortfolioRegime {
   regime: 'RISK_ON' | 'RISK_OFF' | 'TRANSITION';
   confidence: number;             // 0-100 how confident in classification
-  sizeMultiplier: number;         // 0.5 - 1.0 position sizing
+  sizeMultiplier: number;         // 0.85 - 1.0 position sizing (less punitive)
   metrics: {
     avgAdx: number;
     avgVolumeRatio: number;
@@ -55,10 +55,14 @@ export interface RegimeConfig {
   // Trending coins
   trendingCoinPctRiskOn: number;  // % of coins that must be trending
 
-  // Size multipliers
+  // Size multipliers (less punitive - we gate instead of shrink)
   riskOnMultiplier: number;
-  riskOffMultiplier: number;
+  riskOffMultiplier: number;      // Should be 0.85, not 0.5
   transitionMultiplier: number;
+
+  // Gating config (skip weak setups in weak markets)
+  minCoinAdxForRiskOff: number;   // Coin must have ADX >= this in RISK_OFF to trade
+  minCoinAdxForTransition: number; // Coin must have ADX >= this in TRANSITION to trade
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -73,9 +77,13 @@ export const SCALP_REGIME_CONFIG: RegimeConfig = {
   volumeRiskOnMin: 1.3,
   volumeRiskOffMax: 0.7,
   trendingCoinPctRiskOn: 0.45,
+  // Less punitive sizing - gate weak setups instead
   riskOnMultiplier: 1.0,
-  riskOffMultiplier: 0.5,
-  transitionMultiplier: 0.75,
+  riskOffMultiplier: 0.85,      // Was 0.5, now 0.85
+  transitionMultiplier: 0.9,   // Was 0.75, now 0.9
+  // Gating thresholds
+  minCoinAdxForRiskOff: 25,     // In RISK_OFF, skip if coin ADX < 25
+  minCoinAdxForTransition: 28, // In TRANSITION, skip if coin ADX < 28
 };
 
 export const SWING_REGIME_CONFIG: RegimeConfig = {
@@ -86,9 +94,13 @@ export const SWING_REGIME_CONFIG: RegimeConfig = {
   volumeRiskOnMin: 1.2,
   volumeRiskOffMax: 0.6,
   trendingCoinPctRiskOn: 0.50,
+  // Less punitive sizing - gate weak setups instead
   riskOnMultiplier: 1.0,
-  riskOffMultiplier: 0.5,
-  transitionMultiplier: 0.75,
+  riskOffMultiplier: 0.85,      // Was 0.5, now 0.85
+  transitionMultiplier: 0.9,   // Was 0.75, now 0.9
+  // Gating thresholds
+  minCoinAdxForRiskOff: 25,     // In RISK_OFF, skip if coin ADX < 25
+  minCoinAdxForTransition: 28, // In TRANSITION, skip if coin ADX < 28
 };
 
 // ─────────────────────────────────────────────────────────────────
@@ -155,6 +167,37 @@ export class RegimeDetector {
     const recent = this.regimeHistory.slice(-lastN);
     const regimes = new Set(recent.map(r => r.regime));
     return regimes.size > 1;
+  }
+
+  /**
+   * Check if a specific coin should be GATED (skipped) based on portfolio regime
+   * In RISK_OFF/TRANSITION, we skip weak setups, don't just reduce size
+   */
+  shouldGateCoin(coinAdx: number, coinRegime: 'MOMENTUM' | 'RANGE' | 'NONE'): boolean {
+    if (!this.lastRegime) return false;
+
+    const { regime } = this.lastRegime;
+
+    if (regime === 'RISK_ON') {
+      // Full risk-on: don't gate anything
+      return false;
+    }
+
+    if (regime === 'RISK_OFF') {
+      // Gate weak setups: skip if coin ADX too low OR coin in NONE regime
+      if (coinAdx < (this.config as any).minCoinAdxForRiskOff) return true;
+      if (coinRegime === 'NONE') return true;
+      return false;
+    }
+
+    if (regime === 'TRANSITION') {
+      // Transition: more selective
+      if (coinAdx < (this.config as any).minCoinAdxForTransition) return true;
+      if (coinRegime === 'NONE') return true;
+      return false;
+    }
+
+    return false;
   }
 
   // ───────────────────────────────────────────────────────────────

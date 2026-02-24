@@ -2114,16 +2114,39 @@ class CoinTrader {
     const strengthMultiplier = 0.5 + analysis.strength * 1.0;  // 0.5x to 1.5x based on strength
     let kellyRiskPct = baseRiskPct * kellyMultiplier * strengthMultiplier;
 
-    // Liquidity quality multiplier — better setup = bigger position
+    // ─────────────────────────────────────────────────────────────────
+    // FIX: Liquidity → Priority, NOT Size (prevent concentration risk)
+    // High liquidity = take trade, Low liquidity = skip or reduce
+    // NEVER size UP - cap at 1.0x
+    // ─────────────────────────────────────────────────────────────────
     const liqScore = analysis.liquidityScore ?? 0;
     const liqMultiplier =
-      liqScore >= 75 ? 1.5 :    // sweep + QML + pattern = max size
-      liqScore >= 50 ? 1.25 :   // sweep + pattern = larger
-      liqScore >= 25 ? 1.0  :   // basic confirmation = standard
-      0.75;                     // no confirmation = reduced
+      liqScore >= 75 ? 1.0 :    // Best setups = standard size (was 1.5x)
+      liqScore >= 50 ? 1.0 :   // Good setups = standard size (was 1.25x)
+      liqScore >= 25 ? 0.85 :   // Basic confirmation = slight reduction
+      0.75;                      // No confirmation = reduced
+
+    // Skip low-liquidity setups entirely (use as gate, not size)
+    if (liqScore < 15) {
+      console.log(`   ⚠️ ${this.state.symbol}: Low liquidity (${liqScore}/100) - skipping`);
+      return;
+    }
+
     kellyRiskPct *= liqMultiplier;
 
-    // Portfolio regime multiplier — reduce size in hostile market conditions
+    // ─────────────────────────────────────────────────────────────────
+    // FIX: Portfolio regime GATES weak setups, doesn't just shrink size
+    // ─────────────────────────────────────────────────────────────────
+    const coinAdx = tf5m?.momentum?.adx || 0;
+    const coinRegime = tf5m?.momentum?.regime || 'NONE';
+
+    // Gate weak setups in hostile markets
+    if (regimeDetector.shouldGateCoin(coinAdx, coinRegime)) {
+      console.log(`   ⏭️ ${this.state.symbol}: Gated by portfolio regime (${currentPortfolioRegime.regime}) - coin ADX=${coinAdx.toFixed(1)}, regime=${coinRegime}`);
+      return;
+    }
+
+    // Apply modest size reduction for strong setups in weak markets (not punitive)
     kellyRiskPct *= currentPortfolioRegime.sizeMultiplier;
 
     const riskAmount = this.state.balance * (kellyRiskPct / 100);
@@ -2216,7 +2239,7 @@ class CoinTrader {
     console.log(`   Strength: ${(analysis.strength * 100).toFixed(0)}% | Size: ${positionSize.toFixed(4)}`);
     if (liqScore > 0) {
       const liqTag = liqScore >= 75 ? '🔥' : liqScore >= 50 ? '✓' : liqScore >= 25 ? '·' : '⚠';
-      console.log(`   Liquidity: ${liqScore}/100 ${liqTag} (${liqMultiplier}x size)`);
+      console.log(`   Liquidity: ${liqScore}/100 ${liqTag} (${liqMultiplier}x size, capped)`);
     }
   }
 
