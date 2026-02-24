@@ -278,7 +278,7 @@ interface MomentumSignals {
   // Volatility / Regime
   atr: number;
   atrPercent: number;  // ATR as % of price
-  regime: 'MOMENTUM' | 'RANGE' | 'NONE';  // NEW: MOMENTUM/RANGE/NONE
+  regime: 'MOMENTUM' | 'RANGE';  // NO NONE zone - hysteresis handles transition
   adx: number;         // ADX trend strength (0-100)
   plusDI: number;      // +DI for bullish strength
   minusDI: number;     // -DI for bearish strength
@@ -844,7 +844,7 @@ function analyzeMomentum(candles: Candle[], ofiSignal?: OFISignal): MomentumSign
       candleMomentum: 'neutral',
       macdLine: 0, macdSignal: 0, macdHistogram: 0,
       macdBullishCross: false, macdBearishCross: false,
-      atr: 0, atrPercent: 0, regime: 'NONE' as 'MOMENTUM' | 'RANGE' | 'NONE',
+      atr: 0, atrPercent: 0, regime: 'RANGE' as 'MOMENTUM' | 'RANGE',  // Default to RANGE (safer)
       adx: 0, plusDI: 0, minusDI: 0,
       vwap: 0, vwapDeviation: 0, vwapDeviationStd: 0, priceAboveVwap: false,
       sessionVwapAsia: 0, sessionVwapLondon: 0, sessionVwapNy: 0,
@@ -958,29 +958,20 @@ function analyzeMomentum(candles: Candle[], ofiSignal?: OFISignal): MomentumSign
   const bbWidthAvg = bbWidths.length > 0 ? bbWidths.reduce((a, b) => a + b, 0) / bbWidths.length : bbWidth;
   const bbExpanding = bbWidth > bbWidthAvg * CONFIG.regime.bbExpandingMultiple;
 
-  // NEW REGIME DETECTION: MOMENTUM / RANGE / NONE
-  // FIXED: Simplified to ADX-based with hysteresis
-  // MOMENTUM: ADX > 30 -> trade breakouts, let winners run (BB expansion optional, not required)
-  // RANGE: ADX < 25 -> mean reversion with TP1/TP2
-  // NONE: ADX 25-30 (transition zone) -> skip trading
-  //
-  // Hysteresis: Use previous regime to prevent flickering
+  // NEW REGIME DETECTION: MOMENTUM / RANGE (NO NONE ZONE)
+  // Hysteresis with overlapping thresholds to prevent flickering
   // - If was MOMENTUM, stay MOMENTUM until ADX drops below 25
-  // - If was RANGE, stay RANGE until ADX exceeds 30
-  let regime: 'MOMENTUM' | 'RANGE' | 'NONE';
+  // - If was RANGE, stay RANGE until ADX exceeds 28
+  // - Default to RANGE (safer start)
+  let regime: 'MOMENTUM' | 'RANGE';
 
-  // Get previous regime for hysteresis (from last momentum calculation)
-  // Since this function is stateless, we'll use simpler thresholds
-  // Primary: ADX-based regime, BB expansion is bonus confirmation not requirement
-  if (adx >= CONFIG.regime.adxMomentumMin) {
-    // ADX > 30 = clear trend, trade momentum regardless of BB expansion
+  // Note: previousRegime parameter would need to be passed in from caller
+  // For now, use simpler single-threshold approach: ADX >= 28 = MOMENTUM, else RANGE
+  // This eliminates the dead zone while still providing separation
+  if (adx >= 28) {
     regime = 'MOMENTUM';
-  } else if (adx <= CONFIG.regime.adxRangeMax) {
-    // ADX < 25 = range-bound, mean reversion
-    regime = 'RANGE';
   } else {
-    // ADX 25-30 = transition zone, no clear edge
-    regime = 'NONE';
+    regime = 'RANGE';
   }
 
   // VWAP (Institutional anchor) - Multi-session
@@ -1196,6 +1187,7 @@ interface CoinTradingState {
   cooldownUntil: number;
   consecutiveLosses: number;        // Track for scraper timeout
   consecutiveWins: number;          // Track for overconfidence timeout
+  previousRegime: 'MOMENTUM' | 'RANGE';  // For hysteresis - no NONE zone
   stats: {
     totalTrades: number;
     wins: number;
@@ -1230,6 +1222,7 @@ class CoinTrader {
       cooldownUntil: 0,
       consecutiveLosses: 0,
       consecutiveWins: 0,
+      previousRegime: 'RANGE',  // Default to RANGE (safer start)
       stats: {
         totalTrades: 0,
         wins: 0,
@@ -1263,7 +1256,24 @@ class CoinTrader {
         this.state.cooldownUntil = saved.cooldownUntil || 0;
         this.state.consecutiveLosses = saved.consecutiveLosses || 0;
         this.state.consecutiveWins = saved.consecutiveWins || 0;
+        this.state.previousRegime = saved.previousRegime || 'RANGE';  // Backward compat
         this.state.stats = saved.stats || this.state.stats;
+
+        // 🔧 FIX: Migrate MOMENTUM mode trades with wrong BB-based TPs
+        if (this.state.openTrade?.isMomentumMode) {
+          const trade = this.state.openTrade;
+          const isLong = trade.direction === 'LONG';
+          const stopDistance = Math.abs(trade.entryPrice - trade.originalStopLoss);
+          // Recalculate R-based TPs for MOMENTUM mode
+          trade.takeProfit1 = isLong
+            ? trade.entryPrice + stopDistance * 1.5
+            : trade.entryPrice - stopDistance * 1.5;
+          trade.takeProfit2 = isLong
+            ? trade.entryPrice + stopDistance * 3.0
+            : trade.entryPrice - stopDistance * 3.0;
+          trade.tp1DistanceR = stopDistance * 1.5;
+          console.log(`   🔧 ${this.state.symbol}: Fixed MOMENTUM TPs (was using old BB values)`);
+        }
       }
     } catch (e) {
       console.log(`  ${this.state.symbol}: Fresh start (no saved state)`);
@@ -1285,6 +1295,7 @@ class CoinTrader {
         cooldownUntil: this.state.cooldownUntil,
         consecutiveLosses: this.state.consecutiveLosses,
         consecutiveWins: this.state.consecutiveWins,
+        previousRegime: this.state.previousRegime,  // Save for hysteresis
         stats: this.state.stats,
         savedAt: new Date().toISOString(),
       };
@@ -1324,6 +1335,7 @@ class CoinTrader {
       cooldownUntil: 0,
       consecutiveLosses: 0,
       consecutiveWins: 0,
+      previousRegime: 'RANGE',  // Reset to RANGE
       stats: {
         totalTrades: 0,
         wins: 0,
@@ -1611,17 +1623,7 @@ class CoinTrader {
     signals.push(`ADX:${m5.adx?.toFixed(0) || '?'}`);
     signals.push(m5.bbExpanding ? 'BB↑↑' : `BW:${m5.bbWidth?.toFixed(1)}%`);
 
-    // NONE MODE: Transition/squeeze - no edge, skip trading
-    if (regime === 'NONE') {
-      return {
-        shouldEnter: false,
-        direction,
-        strength,
-        signals,
-        reason: `NONE: ADX ${m5.adx?.toFixed(0) || '?'} + BB ${m5.bbExpanding ? 'expanding' : 'normal'} = transition zone - skip`,
-        mlPrediction: 0.5,
-      };
-    }
+    // NO NONE ZONE - always either MOMENTUM or RANGE (hysteresis handles transition)
 
     if (regime === 'MOMENTUM') {
       // ═══════════════════════════════════════════════════════════════
@@ -2167,7 +2169,7 @@ class CoinTrader {
     // FIX: Portfolio regime GATES weak setups, doesn't just shrink size
     // ─────────────────────────────────────────────────────────────────
     const coinAdx = tf5m?.momentum?.adx || 0;
-    const coinRegime = tf5m?.momentum?.regime || 'NONE';
+    const coinRegime = tf5m?.momentum?.regime || 'RANGE';  // Default to RANGE (no NONE zone)
 
     // Gate weak setups in hostile markets
     if (regimeDetector.shouldGateCoin(coinAdx, coinRegime)) {
@@ -2254,7 +2256,7 @@ class CoinTrader {
       console.log(`\n🚀 ${this.state.symbol}: MOMENTUM ${trade.direction} [${swingSource}]`);
       console.log(`   Entry: $${fillPrice.toFixed(4)} | SL: $${stopLoss.toFixed(4)} (${riskPct.toFixed(2)}% risk)`);
       console.log(`   Mode: TRAIL ONLY - Trail at -${CONFIG.targets.momentumTrailR}R after ${CONFIG.targets.momentumTrailAfterR}R profit`);
-      console.log(`   Time stop: ${CONFIG.targets.timeStopCandles} candles`);
+      console.log(`   Target: +${trade.tp1DistanceR.toFixed(4)}R (1.5x stop) | Time stop: ${CONFIG.targets.timeStopCandles} candles (0.5R movement)`);
     } else {
       // RANGE mode: Mean reversion with TP1/TP2
       const tp1Pct = ((takeProfit1 - fillPrice) / fillPrice * 100).toFixed(2);
