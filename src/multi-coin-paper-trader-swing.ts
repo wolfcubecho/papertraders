@@ -1736,14 +1736,16 @@ class CoinTrader {
         ? m4h.emaAligned === 'bullish'
         : m4h.emaAligned === 'bearish';
 
-      const hasBreakout = direction === 'LONG'
-        ? (m4h.priceBreakoutUp || m4h.bbBreakoutUp)
-        : (m4h.priceBreakoutDown || m4h.bbBreakoutDown);
+      // Structure break required (close above/below recent swing high/low)
+      // NOT just BB breakout - need actual price structure break
+      const hasStructureBreak = direction === 'LONG'
+        ? m4h.priceBreakoutUp   // Close > recent swing high
+        : m4h.priceBreakoutDown; // Close < recent swing low
 
-      if (!hasEmaAlign && !hasBreakout) {
-        return { ...noEntry(`MOMENTUM: Need EMA align or breakout`, direction, 'MOMENTUM'), signals };
+      if (!hasEmaAlign && !hasStructureBreak) {
+        return { ...noEntry(`MOMENTUM: Need EMA align or structure break`, direction, 'MOMENTUM'), signals };
       }
-      signals.push(hasEmaAlign ? 'EMA' : 'BRK');
+      signals.push(hasEmaAlign ? 'EMA' : (direction === 'LONG' ? 'SWING↑' : 'SWING↓'));
 
       // VWAP confirmation (soft - not a hard gate for swing trading)
       const hasVwapConfirm = direction === 'LONG' ? m4h.priceAboveVwap : !m4h.priceAboveVwap;
@@ -2419,7 +2421,7 @@ class CoinTrader {
         trade.tp1Hit = true;
         return {
           closed: false,
-          message: `TP1 HIT (+33% closed) | SL->BE`,
+          message: `TP1 HIT (+33% closed) | SL->+0.2R`,
           pnl: unrealizedPnl, pnlPercent, pnlSign: '+',
         };
       }
@@ -2495,10 +2497,32 @@ class CoinTrader {
       }
     }
 
-    // Timeout
+    // Timeout with "no movement" check
     if (CONFIG.maxHoldHours > 0) {
       const heldMs = Date.now() - trade.entryTime;
       const maxHoldMs = CONFIG.maxHoldHours * 60 * 60 * 1000;
+
+      // Early timeout check at 24 hours with "no movement" condition
+      const earlyTimeoutMs = 24 * 60 * 60 * 1000; // 24 hours
+      if (heldMs >= earlyTimeoutMs && heldMs < maxHoldMs) {
+        // Calculate R-based movement: how far from entry in R units
+        const stopDistance = Math.abs(trade.entryPrice - trade.originalStopLoss);
+        const priceMovement = Math.abs(currentPrice - trade.entryPrice);
+        const movementInR = stopDistance > 0 ? priceMovement / stopDistance : 0;
+
+        // Exit if "no movement" (less than 0.5R from entry after 24h)
+        if (movementInR < 0.5) {
+          await this.closeTrade(currentPrice, 'TIMEOUT');
+          return {
+            closed: true,
+            message: `TIMEOUT (24h, no movement: ${movementInR.toFixed(2)}R)`,
+            pnl: unrealizedPnl, pnlPercent,
+            pnlSign: unrealizedPnl >= 0 ? '+' : '',
+          };
+        }
+      }
+
+      // Final timeout at max hold hours
       if (heldMs >= maxHoldMs) {
         await this.closeTrade(currentPrice, 'TIMEOUT');
         return {
@@ -2612,9 +2636,14 @@ class CoinTrader {
     console.log(`   Remaining: ${trade.currentPositionSize.toFixed(6)}`);
 
     if (reason === 'TP1' && !trade.stopLossMovedToBreakeven) {
-      trade.stopLoss = trade.entryPrice;
+      // Move SL to Entry + 0.2R (protected profit, not just breakeven)
+      const stopDistance = Math.abs(trade.entryPrice - trade.originalStopLoss);
+      const protectedSlDistance = stopDistance * 0.2; // 0.2R
+      trade.stopLoss = isLong
+        ? trade.entryPrice + protectedSlDistance
+        : trade.entryPrice - protectedSlDistance;
       trade.stopLossMovedToBreakeven = true;
-      console.log(`   SL moved to breakeven ($${trade.entryPrice.toFixed(2)})\n`);
+      console.log(`   SL moved to +0.2R ($${trade.stopLoss.toFixed(2)})\n`);
     } else {
       console.log();
     }
