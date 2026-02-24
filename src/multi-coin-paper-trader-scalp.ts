@@ -166,6 +166,13 @@ const CONFIG = {
     rangeLongThreshold: 0.15,      // BB < 15% for LONG entries (was 25% - TRUE extreme only)
     rangeShortThreshold: 0.85,     // BB > 85% for SHORT entries (was 75%)
 
+    // NEAR_EXTREME sub-mode: Allow entries at 15-30% with reduced size (0.5x)
+    nearExtremeLongMin: 0.15,      // BB >= 15%
+    nearExtremeLongMax: 0.30,      // BB <= 30%
+    nearExtremeShortMin: 0.70,     // BB >= 70%
+    nearExtremeShortMax: 0.85,     // BB <= 85%
+    nearExtremeSizeMultiplier: 0.5, // Half size for near-extreme entries
+
     // MOMENTUM mode: breakout entries, trail at -1R (no fixed TPs)
     // RANGE mode: mean reversion with TP1/TP2
     // NONE mode: transition/squeeze - skip trading
@@ -1491,6 +1498,7 @@ class CoinTrader {
     reason: string;
     mlPrediction: number;
     liquidityScore?: number;
+    nearExtreme?: boolean;
   } {
     const tf5m = this.state.timeframes.get('5m');
     const tf1m = this.state.timeframes.get('1m');
@@ -1752,10 +1760,22 @@ class CoinTrader {
       // ═══════════════════════════════════════════════════════════════
       // Override direction based on BB position for mean reversion
       let rangeDirection: 'LONG' | 'SHORT' | 'SKIP' = 'SKIP';
-      if (bbPos < CONFIG.regime.rangeLongThreshold) {  // < 25%
+      let nearExtreme = false;  // Flag for NEAR_EXTREME sub-mode (15-30% or 70-85%)
+
+      if (bbPos < CONFIG.regime.rangeLongThreshold) {  // < 15% = TRUE extreme
         rangeDirection = 'LONG';
-      } else if (bbPos > CONFIG.regime.rangeShortThreshold) {  // > 75%
+      } else if (bbPos > CONFIG.regime.rangeShortThreshold) {  // > 85% = TRUE extreme
         rangeDirection = 'SHORT';
+      } else if (bbPos >= CONFIG.regime.nearExtremeLongMin && bbPos <= CONFIG.regime.nearExtremeLongMax) {
+        // NEAR_EXTREME LONG: BB 15-30%
+        rangeDirection = 'LONG';
+        nearExtreme = true;
+        signals.push('NEAR_EXTREME');
+      } else if (bbPos >= CONFIG.regime.nearExtremeShortMin && bbPos <= CONFIG.regime.nearExtremeShortMax) {
+        // NEAR_EXTREME SHORT: BB 70-85%
+        rangeDirection = 'SHORT';
+        nearExtreme = true;
+        signals.push('NEAR_EXTREME');
       }
 
       if (rangeDirection === 'SKIP') {
@@ -1992,7 +2012,9 @@ class CoinTrader {
       // ALL HARD FILTERS PASSED - Full strength entry
       const rangeStrength = Math.min(1, strength + (williamsAtExtreme ? 0.15 : 0));
 
-      const bbZone = bbPos < CONFIG.regime.rangeLongThreshold ? 'lower' : 'upper';
+      const bbZone = nearExtreme
+        ? 'near-' + (direction_override === 'LONG' ? 'lower' : 'upper')
+        : (bbPos < CONFIG.regime.rangeLongThreshold ? 'lower' : 'upper');
       return {
         shouldEnter: true,
         direction: direction_override,
@@ -2001,11 +2023,12 @@ class CoinTrader {
         reason: `RANGE ${direction_override} @ BB ${bbZone}+VOL${williamsAtExtreme ? '+W%R' : ''}${candleTurning ? '+CANDLE' : ''}`,
         mlPrediction: 0.5,
         liquidityScore,
+        nearExtreme,  // Flag for reduced sizing (0.5x)
       };
     }
   }
 
-  private enterTrade(analysis: { direction: 'LONG' | 'SHORT'; strength: number; signals: string[]; liquidityScore?: number }, currentPrice: number): void {
+  private enterTrade(analysis: { direction: 'LONG' | 'SHORT'; strength: number; signals: string[]; liquidityScore?: number; nearExtreme?: boolean }, currentPrice: number): void {
     const isLong = analysis.direction === 'LONG';
     const tf5m = this.state.timeframes.get('5m');
     const tf15m = this.state.timeframes.get('15m');
@@ -2179,6 +2202,15 @@ class CoinTrader {
 
     // Apply modest size reduction for strong setups in weak markets (not punitive)
     kellyRiskPct *= currentPortfolioRegime.sizeMultiplier;
+
+    // ─────────────────────────────────────────────────────────────────
+    // NEAR_EXTREME sub-mode: 0.5x size for entries at BB 15-30% / 70-85%
+    // Less extreme = lower probability = smaller position
+    // ─────────────────────────────────────────────────────────────────
+    if (analysis.nearExtreme) {
+      kellyRiskPct *= CONFIG.regime.nearExtremeSizeMultiplier;  // 0.5x
+      console.log(`   📍 ${this.state.symbol}: NEAR_EXTREME entry - size reduced to ${CONFIG.regime.nearExtremeSizeMultiplier}x`);
+    }
 
     const riskAmount = this.state.balance * (kellyRiskPct / 100);
     let positionSize = riskAmount / stopDistance;
