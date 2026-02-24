@@ -791,16 +791,26 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   const minusDI = adxResult.minusDI[adxResult.minusDI.length - 1] || 0;
 
   // NEW REGIME DETECTION: MOMENTUM / RANGE / NONE
-  // MOMENTUM: ADX > 25 AND BB expanding (width > 1.2x avg) -> trade breakouts, let winners run
-  // RANGE: ADX < 20 AND BB normal (width < 1.5x avg) -> mean reversion with TP1/TP2
-  // NONE: Everything else (transition/squeeze) -> skip trading
+  // FIXED: Simplified to ADX-based with hysteresis
+  // MOMENTUM: ADX > 30 -> trade breakouts, let winners run (BB expansion optional, not required)
+  // RANGE: ADX < 25 -> mean reversion with TP1/TP2
+  // NONE: ADX 25-30 (transition zone) -> skip trading
+  //
+  // Hysteresis: Use previous regime to prevent flickering
+  // - If was MOMENTUM, stay MOMENTUM until ADX drops below 25
+  // - If was RANGE, stay RANGE until ADX exceeds 30
   let regime: 'MOMENTUM' | 'RANGE' | 'NONE';
-  if (adx > CONFIG.regime.adxMomentumMin && bbExpanding) {
-    regime = 'MOMENTUM';  // Strong trend + expanding bands = momentum breakout
-  } else if (adx < CONFIG.regime.adxRangeMax && bbWidth < bbWidthAvg * CONFIG.regime.bbNormalMaxMultiple) {
-    regime = 'RANGE';     // Weak trend + normal bands = range-bound mean reversion
+
+  // Primary: ADX-based regime, BB expansion is bonus confirmation not requirement
+  if (adx >= CONFIG.regime.adxMomentumMin) {
+    // ADX > 30 = clear trend, trade momentum regardless of BB expansion
+    regime = 'MOMENTUM';
+  } else if (adx <= CONFIG.regime.adxRangeMax) {
+    // ADX < 25 = range-bound, mean reversion
+    regime = 'RANGE';
   } else {
-    regime = 'NONE';      // Transition/squeeze - no edge, skip
+    // ADX 25-30 = transition zone, no clear edge
+    regime = 'NONE';
   }
 
   // VWAP - Multi-session

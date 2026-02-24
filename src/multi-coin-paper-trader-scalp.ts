@@ -959,16 +959,28 @@ function analyzeMomentum(candles: Candle[], ofiSignal?: OFISignal): MomentumSign
   const bbExpanding = bbWidth > bbWidthAvg * CONFIG.regime.bbExpandingMultiple;
 
   // NEW REGIME DETECTION: MOMENTUM / RANGE / NONE
-  // MOMENTUM: ADX > 25 AND BB expanding (width > 1.2x avg) -> trade breakouts, let winners run
-  // RANGE: ADX < 20 AND BB normal (width < 1.5x avg) -> mean reversion with TP1/TP2
-  // NONE: Everything else (transition/squeeze) -> skip trading
+  // FIXED: Simplified to ADX-based with hysteresis
+  // MOMENTUM: ADX > 30 -> trade breakouts, let winners run (BB expansion optional, not required)
+  // RANGE: ADX < 25 -> mean reversion with TP1/TP2
+  // NONE: ADX 25-30 (transition zone) -> skip trading
+  //
+  // Hysteresis: Use previous regime to prevent flickering
+  // - If was MOMENTUM, stay MOMENTUM until ADX drops below 25
+  // - If was RANGE, stay RANGE until ADX exceeds 30
   let regime: 'MOMENTUM' | 'RANGE' | 'NONE';
-  if (adx > CONFIG.regime.adxMomentumMin && bbExpanding) {
-    regime = 'MOMENTUM';  // Strong trend + expanding bands = momentum breakout
-  } else if (adx < CONFIG.regime.adxRangeMax && bbWidth < bbWidthAvg * CONFIG.regime.bbNormalMaxMultiple) {
-    regime = 'RANGE';     // Weak trend + normal bands = range-bound mean reversion
+
+  // Get previous regime for hysteresis (from last momentum calculation)
+  // Since this function is stateless, we'll use simpler thresholds
+  // Primary: ADX-based regime, BB expansion is bonus confirmation not requirement
+  if (adx >= CONFIG.regime.adxMomentumMin) {
+    // ADX > 30 = clear trend, trade momentum regardless of BB expansion
+    regime = 'MOMENTUM';
+  } else if (adx <= CONFIG.regime.adxRangeMax) {
+    // ADX < 25 = range-bound, mean reversion
+    regime = 'RANGE';
   } else {
-    regime = 'NONE';      // Transition/squeeze - no edge, skip
+    // ADX 25-30 = transition zone, no clear edge
+    regime = 'NONE';
   }
 
   // VWAP (Institutional anchor) - Multi-session
@@ -1454,7 +1466,9 @@ class CoinTrader {
       return { status: 'ENTERED', details: analysis.reason };
     }
 
-    return { status: 'SCAN', details: `${analysis.direction} (${analysis.signals.join(', ')})` };
+    // Show rejection reason for debugging (first 80 chars)
+    const rejectionReason = analysis.reason.length > 80 ? analysis.reason.slice(0, 77) + '...' : analysis.reason;
+    return { status: 'SCAN', details: `${analysis.direction} (${analysis.signals.join(', ')}) [${rejectionReason}]` };
   }
 
   private analyzeForEntry(): {
@@ -2059,22 +2073,36 @@ class CoinTrader {
 
 
     // ═══════════════════════════════════════════════════════════════
-    // BB-BASED TARGETS: Mean reversion scalping
-    // TP1 = Middle BB (70% close), TP2 = Opposite BB (30% close)
+    // REGIME-SPECIFIC TARGETS
+    // RANGE mode: BB-based (mean reversion)
+    // MOMENTUM mode: R-based (let winners run)
     // ═══════════════════════════════════════════════════════════════
 
-    // Get BB values from 5m momentum
+    // Get BB values from 5m momentum (for RANGE mode)
     const bbMiddle = momentum5m?.bbMiddle || currentPrice;
     const bbUpper = momentum5m?.bbUpper || currentPrice * 1.01;
     const bbLower = momentum5m?.bbLower || currentPrice * 0.99;
 
-    // TP1 = Middle BB (mean reversion target)
-    // TP2 = Opposite BB band (full reversal target)
-    const takeProfit1 = bbMiddle;  // Middle BB
-    const takeProfit2 = isLong ? bbUpper : bbLower;  // Opposite band
+    // Determine regime for TP calculation
+    const isMomentumMode = momentum5m?.regime === 'MOMENTUM';
 
-    // R = TP1 distance (not SL distance!) - used for all post-TP1 calculations
-    const tp1DistanceR = Math.abs(takeProfit1 - currentPrice);
+    let takeProfit1: number;
+    let takeProfit2: number;
+    let tp1DistanceR: number;
+
+    if (isMomentumMode) {
+      // MOMENTUM mode: R-based targets (breakout trade)
+      // TP1 = 1.5R, TP2 = 3R - let trends run
+      takeProfit1 = isLong ? currentPrice + stopDistance * 1.5 : currentPrice - stopDistance * 1.5;
+      takeProfit2 = isLong ? currentPrice + stopDistance * 3.0 : currentPrice - stopDistance * 3.0;
+      tp1DistanceR = stopDistance * 1.5;  // R = 1.5 * stop distance
+    } else {
+      // RANGE mode: BB-based targets (mean reversion)
+      // TP1 = Middle BB, TP2 = Opposite BB
+      takeProfit1 = bbMiddle;
+      takeProfit2 = isLong ? bbUpper : bbLower;
+      tp1DistanceR = Math.abs(takeProfit1 - currentPrice);
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // KELLY CRITERION POSITION SIZING
@@ -2179,7 +2207,7 @@ class CoinTrader {
     const entryFee = notional * CONFIG.takerFeeRate;
 
     // Determine if MOMENTUM mode (breakout trade with trailing only)
-    const isMomentumMode = momentum5m?.regime === 'MOMENTUM';
+    // Note: isMomentumMode already defined above for TP calculation
 
     const trade: PaperTrade = {
       id: `${this.state.symbol}-${Date.now()}`,
@@ -2189,7 +2217,7 @@ class CoinTrader {
       entryTime: Date.now(),
       stopLoss,
       originalStopLoss: stopLoss,
-      tp1DistanceR: isMomentumMode ? stopDistance : tp1DistanceR,  // MOMENTUM: R = stop distance
+      tp1DistanceR,  // Calculated above based on regime
       takeProfit1,
       takeProfit2,
       isMomentumMode,              // MOMENTUM = trail only, RANGE = TP1/TP2
