@@ -14,6 +14,10 @@
  * Usage: npm run paper-trade-multi-scalp
  */
 
+// Load environment variables FIRST
+import dotenv from 'dotenv';
+dotenv.config();
+
 import { createRequire } from 'module';
 import fs from 'fs';
 import path from 'path';
