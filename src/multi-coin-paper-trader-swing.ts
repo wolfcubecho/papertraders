@@ -2211,20 +2211,20 @@ class CoinTrader {
 
     // ─────────────────────────────────────────────────────────────────
     // FIX: Liquidity → Priority, NOT Size (prevent concentration risk)
-    // High liquidity = take trade, Low liquidity = skip or reduce
+    // High liquidity = take trade, Low/No liquidity = still trade, just standard size
     // NEVER size UP - cap at 1.0x
+    // NOTE: Removed the hard gate - liquidity is optional bonus, not requirement
     // ─────────────────────────────────────────────────────────────────
     const liqScore = analysis.liquidityScore ?? 0;
     const liqMultiplier =
       liqScore >= 75 ? 1.0 :    // Best setups = standard size (was 1.5x - DANGEROUS)
       liqScore >= 50 ? 1.0 :   // Good setups = standard size (was 1.25x)
-      liqScore >= 25 ? 0.85 :   // Basic confirmation = slight reduction
-      0.75;                      // No confirmation = reduced
+      liqScore >= 25 ? 0.9 :   // Basic confirmation = slight reduction
+      0.85;                     // No confirmation = slightly reduced (not blocked!)
 
-    // Skip low-liquidity setups entirely (use as gate, not size)
-    if (liqScore < 15) {
-      console.log(`   ⚠️ ${this.state.symbol}: Low liquidity (${liqScore}/100) - skipping`);
-      return;
+    // Log liquidity score but don't skip
+    if (liqScore > 0) {
+      console.log(`   💧 ${this.state.symbol}: Liquidity score ${liqScore}/100 (${liqMultiplier}x size)`);
     }
 
     adjustedRiskPct *= liqMultiplier;

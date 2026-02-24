@@ -191,7 +191,7 @@ const CONFIG = {
     // RANGE MODE: BB-BASED TARGETS (Mean Reversion)
     tp1ClosePct: 0.60,             // Close 60% at Middle BB (was 70% - leave more for TP2)
     tp2ClosePct: 0.40,             // Close 40% at Opposite BB (was 30%)
-    protectedProfitR: 0.3,         // After TP1, SL moves to Entry + 0.3R (was 0.2)
+    protectedProfitR: 0.2,         // After TP1, SL moves to Entry + 0.2R (protected profit, not breakeven)
     phase2TriggerR: 0.6,           // When profit reaches TP2 - 0.4R (was 0.7)
     phase2TrailR: 0.4,             // Trail at 0.4R distance (was 0.5)
     // MOMENTUM MODE: Breakout trail (no fixed TPs)
@@ -1646,22 +1646,23 @@ class CoinTrader {
       }
       signals.push('VWAP✓');
 
-      // 2. Breakout required (BB breakout OR price breakout) - momentum IS confirmation
-      const hasBreakout = isLong
-        ? (m5.bbBreakoutUp || m5.priceBreakoutUp)
-        : (m5.bbBreakoutDown || m5.priceBreakoutDown);
+      // 2. Structure break required (close above/below recent swing high/low)
+      // NOT just BB breakout - need actual price structure break
+      const hasStructureBreak = isLong
+        ? m5.priceBreakoutUp   // Close > recent swing high
+        : m5.priceBreakoutDown; // Close < recent swing low
 
-      if (!hasBreakout) {
+      if (!hasStructureBreak) {
         return {
           shouldEnter: false,
           direction,
           strength,
           signals,
-          reason: `MOMENTUM: No breakout (need BB or price break)`,
+          reason: `MOMENTUM: No structure break (need close above swing ${isLong ? 'high' : 'low'})`,
           mlPrediction: 0.5,
         };
       }
-      signals.push(isLong ? (m5.bbBreakoutUp ? 'BB↑' : 'BRK↑') : (m5.bbBreakoutDown ? 'BB↓' : 'BRK↓'));
+      signals.push(isLong ? 'SWING↑' : 'SWING↓');
 
       // 3. Volume spike REQUIRED (2x for MOMENTUM mode)
       const volumeThreshold = CONFIG.momentum.volumeSpikeMultipleMomentum;  // 2x
@@ -2144,20 +2145,20 @@ class CoinTrader {
 
     // ─────────────────────────────────────────────────────────────────
     // FIX: Liquidity → Priority, NOT Size (prevent concentration risk)
-    // High liquidity = take trade, Low liquidity = skip or reduce
+    // High liquidity = take trade, Low/No liquidity = still trade, just standard size
     // NEVER size UP - cap at 1.0x
+    // NOTE: Removed the hard gate - liquidity is optional bonus, not requirement
     // ─────────────────────────────────────────────────────────────────
     const liqScore = analysis.liquidityScore ?? 0;
     const liqMultiplier =
       liqScore >= 75 ? 1.0 :    // Best setups = standard size (was 1.5x)
       liqScore >= 50 ? 1.0 :   // Good setups = standard size (was 1.25x)
-      liqScore >= 25 ? 0.85 :   // Basic confirmation = slight reduction
-      0.75;                      // No confirmation = reduced
+      liqScore >= 25 ? 0.9 :   // Basic confirmation = slight reduction
+      0.85;                     // No confirmation = slightly reduced (not blocked!)
 
-    // Skip low-liquidity setups entirely (use as gate, not size)
-    if (liqScore < 15) {
-      console.log(`   ⚠️ ${this.state.symbol}: Low liquidity (${liqScore}/100) - skipping`);
-      return;
+    // Log liquidity score but don't skip
+    if (liqScore > 0) {
+      console.log(`   💧 ${this.state.symbol}: Liquidity score ${liqScore}/100 (${liqMultiplier}x size)`);
     }
 
     kellyRiskPct *= liqMultiplier;
@@ -2261,7 +2262,7 @@ class CoinTrader {
       console.log(`\n⚡ ${this.state.symbol}: RANGE ${trade.direction} [${swingSource}]`);
       console.log(`   Entry: $${fillPrice.toFixed(4)} | SL: $${stopLoss.toFixed(4)} (${riskPct.toFixed(2)}% risk)`);
       console.log(`   TP1: $${takeProfit1.toFixed(4)} (Middle BB ${tp1Pct}%) | TP2: $${takeProfit2.toFixed(4)} (Opposite BB ${tp2Pct}%)`);
-      console.log(`   Split: 70% at TP1, 30% at TP2 | Time stop: ${CONFIG.targets.timeStopCandles} candles`);
+      console.log(`   Split: ${(CONFIG.targets.tp1ClosePct * 100).toFixed(0)}% at TP1, ${(CONFIG.targets.tp2ClosePct * 100).toFixed(0)}% at TP2 | Time stop: ${CONFIG.targets.timeStopCandles} candles (0.5R movement required)`);
     }
     console.log(`   Signals: ${analysis.signals.join(', ')}`);
     console.log(`   Strength: ${(analysis.strength * 100).toFixed(0)}% | Size: ${positionSize.toFixed(4)}`);
@@ -2311,10 +2312,19 @@ class CoinTrader {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // TIME STOP - Exit remaining after N candles
+    // TIME STOP - Exit after N candles IF no movement
+    // "No movement" = price within 0.5R of entry
     // ═══════════════════════════════════════════════════════════════
     if (trade.candlesHeld >= CONFIG.targets.timeStopCandles) {
-      return this.closeTrade(currentPrice, 'TIMEOUT', pnl, pnlPercent);
+      // Calculate R-based movement: how far from entry in R units
+      const priceMovement = Math.abs(currentPrice - trade.entryPrice);
+      const movementInR = priceMovement / trade.tp1DistanceR;  // R = tp1DistanceR
+
+      // Only time out if "no movement" (less than 0.5R from entry)
+      if (movementInR < 0.5) {
+        return this.closeTrade(currentPrice, 'TIMEOUT', pnl, pnlPercent);
+      }
+      // If there's meaningful movement, let it run
     }
 
     // Also check minute-based timeout for very long holds
@@ -2384,7 +2394,7 @@ class CoinTrader {
     if (!trade.tp1Hit) {
       if ((isLong && tpCheckPrice >= trade.takeProfit1) || (!isLong && tpCheckPrice <= trade.takeProfit1)) {
         trade.tp1Hit = true;
-        const closeAmount = trade.originalPositionSize * CONFIG.targets.tp1ClosePct;  // 70%
+        const closeAmount = trade.originalPositionSize * CONFIG.targets.tp1ClosePct;  // 60%
         // IMPORTANT: Close at TP1 price, not current price (wick may have retracted)
         this.closePartialTrade(trade.takeProfit1, closeAmount, 'TP1');
 
@@ -2399,7 +2409,7 @@ class CoinTrader {
         const newPnl = newPriceDiff * trade.currentPositionSize;
         const newPnlPercent = (newPriceDiff / trade.entryPrice) * 100;
 
-        return { closed: false, message: `TP1 HIT (+70%) | SL→+0.2R | PnL: ${newPnlPercent >= 0 ? '+' : ''}${newPnlPercent.toFixed(2)}%` };
+        return { closed: false, message: `TP1 HIT (+${(CONFIG.targets.tp1ClosePct * 100).toFixed(0)}%) | SL→+${CONFIG.targets.protectedProfitR}R | PnL: ${newPnlPercent >= 0 ? '+' : ''}${newPnlPercent.toFixed(2)}%` };
       }
     }
 
