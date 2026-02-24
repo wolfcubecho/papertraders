@@ -23,6 +23,40 @@ const Binance = require('binance-api-node').default;
 import { Candle, SMCIndicators } from './smc-indicators.js';
 import { FeatureExtractor, TradeFeatures } from './trade-features.js';
 import { LightGBMPredictor } from './lightgbm-predictor.js';
+import { detectLiquiditySignals, SCALP_CONFIG, LiquiditySignals } from './liquidity-signals.js';
+import { RegimeDetector, SCALP_REGIME_CONFIG, extractRegimeSignals, PortfolioRegime, CoinRegimeSignals } from './regime-detector.js';
+import { ParameterAnalyzer, ClosedTrade, AnalysisResult, formatSuggestions, DEFAULT_CONFIG } from './parameter-analyzer.js';
+import { LLMReporter, LLMReport, formatRecommendations, DEFAULT_LLM_CONFIG } from './llm-reporter.js';
+
+// ═══════════════════════════════════════════════════════════════
+// PORTFOLIO-LEVEL REGIME (shared across all CoinTraders)
+// ═══════════════════════════════════════════════════════════════
+const regimeDetector = new RegimeDetector(SCALP_REGIME_CONFIG);
+let currentPortfolioRegime: PortfolioRegime = {
+  regime: 'TRANSITION',
+  confidence: 50,
+  sizeMultiplier: 0.75,
+  metrics: {
+    avgAdx: 0,
+    avgVolumeRatio: 0,
+    bbExpansionRatio: 0,
+    trendingCoinCount: 0,
+    totalCoinCount: 0,
+  },
+  reasons: ['Not yet classified'],
+};
+
+// ═══════════════════════════════════════════════════════════════
+// PARAMETER ANALYZER (shared across all CoinTraders)
+// ═══════════════════════════════════════════════════════════════
+const parameterAnalyzer = new ParameterAnalyzer(DEFAULT_CONFIG);
+let lastAnalysisResult: AnalysisResult | null = null;
+
+// ═══════════════════════════════════════════════════════════════
+// LLM REPORTER (sends analysis to GLM 5 for recommendations)
+// ═══════════════════════════════════════════════════════════════
+const llmReporter = new LLMReporter(DEFAULT_LLM_CONFIG);
+let lastLLMReport: LLMReport | null = null;
 
 // Top 20 coins for scalping
 const SYMBOLS = [
@@ -69,18 +103,18 @@ const CONFIG = {
   // MOMENTUM THRESHOLDS
   // ═══════════════════════════════════════════════════════════════
   momentum: {
-    // Volume spike detection (MOMENTUM needs 2x, RANGE needs 1.5x)
+    // Volume spike detection (MOMENTUM needs 2x, RANGE needs 1.2x)
     volumeSpikeMultipleMomentum: 2.0,   // MOMENTUM mode: Volume > 2x average
-    volumeSpikeMultipleRange: 1.5,      // RANGE mode: Volume > 1.5x average
-    volumeSpikeMultiple: 1.5,           // Default (used for signal counting)
+    volumeSpikeMultipleRange: 1.2,      // RANGE mode: Volume > 1.2x average (was 1.5)
+    volumeSpikeMultiple: 1.2,           // Default (used for signal counting)
     volumeAvgPeriod: 20,                // 20-candle average for comparison
 
     // RSI settings
     rsiPeriod: 14,
     rsiBullishCross: 50,           // RSI crossing above 50 = bullish momentum
     rsiBearishCross: 50,           // RSI crossing below 50 = bearish momentum
-    rsiOverbought: 70,
-    rsiOversold: 30,
+    rsiOverbought: 75,             // was 70 - at BB extremes RSI 70 is common
+    rsiOversold: 25,               // was 30
 
     // EMA crossover
     emaFast: 9,
@@ -94,7 +128,7 @@ const CONFIG = {
     breakoutLookback: 10,          // Look for break of 10-candle high/low
 
     // Candle momentum
-    minBodyRatio: 0.6,             // Body must be > 60% of candle range
+    minBodyRatio: 0.5,             // Body must be > 50% of candle range (was 0.6 - range reversals have smaller bodies)
 
     // Confluence required (increased for quality entries)
     minSignals: 2,                 // Need at least 2 momentum signals
@@ -117,16 +151,16 @@ const CONFIG = {
     atrPeriod: 14,
 
     // ADX thresholds for regime classification
-    adxMomentumMin: 25,            // ADX > 25 = strong trend
-    adxRangeMax: 20,               // ADX < 20 = weak/range-bound
+    adxMomentumMin: 30,            // ADX > 30 = strong trend (was 25 - less MOMENTUM, more RANGE)
+    adxRangeMax: 25,               // ADX < 25 = weak/range-bound (was 20 - wider RANGE window)
 
     // BB width thresholds (as multiple of average)
-    bbExpandingMultiple: 1.2,      // BB width > 1.2x avg = expanding/volatile
-    bbNormalMaxMultiple: 1.5,      // BB width < 1.5x avg = normal (not squeeze)
+    bbExpandingMultiple: 1.3,      // BB width > 1.3x avg = expanding/volatile (was 1.2)
+    bbNormalMaxMultiple: 1.8,      // BB width < 1.8x avg = normal (was 1.5 - more tolerance)
 
     // BB mean reversion thresholds (for RANGE mode)
-    rangeLongThreshold: 0.25,      // BB < 25% for LONG entries
-    rangeShortThreshold: 0.75,     // BB > 75% for SHORT entries
+    rangeLongThreshold: 0.15,      // BB < 15% for LONG entries (was 25% - TRUE extreme only)
+    rangeShortThreshold: 0.85,     // BB > 85% for SHORT entries (was 75%)
 
     // MOMENTUM mode: breakout entries, trail at -1R (no fixed TPs)
     // RANGE mode: mean reversion with TP1/TP2
@@ -149,18 +183,18 @@ const CONFIG = {
   // ENTRY/EXIT - DUAL MODE TARGETS
   // ═══════════════════════════════════════════════════════════════
   targets: {
-    stopLossPct: 0.50,             // Fallback SL % (primary uses ATR 1.5x)
+    stopLossPct: 0.40,             // Fallback SL % (was 0.50 - tighter stops)
     // RANGE MODE: BB-BASED TARGETS (Mean Reversion)
-    tp1ClosePct: 0.70,             // Close 70% at Middle BB (TP1)
-    tp2ClosePct: 0.30,             // Close 30% at Opposite BB (TP2)
-    protectedProfitR: 0.2,         // After TP1, SL moves to Entry + 0.2R
-    phase2TriggerR: 0.7,           // When profit reaches TP2 - 0.3R
-    phase2TrailR: 0.5,             // Trail at 0.5R distance
+    tp1ClosePct: 0.60,             // Close 60% at Middle BB (was 70% - leave more for TP2)
+    tp2ClosePct: 0.40,             // Close 40% at Opposite BB (was 30%)
+    protectedProfitR: 0.3,         // After TP1, SL moves to Entry + 0.3R (was 0.2)
+    phase2TriggerR: 0.6,           // When profit reaches TP2 - 0.4R (was 0.7)
+    phase2TrailR: 0.4,             // Trail at 0.4R distance (was 0.5)
     // MOMENTUM MODE: Breakout trail (no fixed TPs)
     momentumTrailR: 1.0,           // Trail at -1R from entry (let winners run)
     momentumTrailAfterR: 0.5,      // Start trailing after 0.5R profit
     // Time stop for runners
-    timeStopCandles: 5,            // Exit remaining position after 5 candles
+    timeStopCandles: 3,            // Exit remaining position after 3 candles (15 min)
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -174,8 +208,8 @@ const CONFIG = {
   // ═══════════════════════════════════════════════════════════════
   // TIMING - TRUE SCALPING (Quality over Quantity)
   // ═══════════════════════════════════════════════════════════════
-  maxHoldMinutes: 15,              // Max 15 mins - faster exits for dead trades
-  cooldownMs: 60_000,              // 1 minute cooldown between trades
+  maxHoldMinutes: 15,              // Max 15 mins - consistent with 3 candles
+  cooldownMs: 90_000,              // 90s cooldown (was 60s - range setups need time)
   onlyEnterOnCandleClose: false,   // Scalper can enter mid-candle
   maxDailyTrades: 9999,            // No limit - need all data for paper trading
   // Overtrading = 34% less profitable. Frequency is enemy of edge.
@@ -276,6 +310,9 @@ interface MomentumSignals {
   bearishSignals: number;
   direction: 'LONG' | 'SHORT' | 'NEUTRAL';
   strength: number;  // 0-1
+
+  // Liquidity signals (stop hunts, fakeouts, QML, flip zones)
+  liquiditySignals?: LiquiditySignals;
 }
 
 function calculateRSI(candles: Candle[], period: number): number[] {
@@ -1079,6 +1116,7 @@ interface PaperTrade {
   originalPositionSize: number;
   currentPositionSize: number;
   candlesHeld: number;              // Track for time stop
+  lastCandleTime: number;           // Track for incrementing candlesHeld on candle close
   tp1Hit: boolean;
   tp2Hit: boolean;
   phase2Active: boolean;            // Phase 2 trailing active (RANGE mode) or trailing active (MOMENTUM mode)
@@ -1323,6 +1361,12 @@ class CoinTrader {
       // Calculate OFI if we have order book depth
       const ofiSignal = tf.orderBookDepth ? calculateOFI(tf.orderBookDepth) : undefined;
       tf.momentum = analyzeMomentum(tf.candles, ofiSignal);
+
+      // Run liquidity detection on primary timeframe only
+      if (interval === CONFIG.primaryInterval && tf.candles.length >= 20) {
+        tf.momentum.liquiditySignals = detectLiquiditySignals(tf.candles as any[], SCALP_CONFIG);
+      }
+
       tf.lastUpdate = now;
     } catch (e: any) {
       if (!e.message?.includes('ENOTFOUND')) {
@@ -1416,6 +1460,7 @@ class CoinTrader {
     signals: string[];
     reason: string;
     mlPrediction: number;
+    liquidityScore?: number;
   } {
     const tf5m = this.state.timeframes.get('5m');
     const tf1m = this.state.timeframes.get('1m');
@@ -1736,71 +1781,84 @@ class CoinTrader {
       }
 
       // ═══════════════════════════════════════════════════════════════
-      // BAND WALK DETECTION: Check last 2 candles
-      // If price closed in extreme zone for 2+ candles = walking, not reversing
-      // SOFT FILTER: Reduce size instead of blocking
+      // BAND WALK DETECTION - HARD FILTER
+      // If price closed in extreme zone for 3+ candles = walking, not reversing
+      // Walking = momentum continuing, NOT reversing - BLOCK ENTRY
       // ═══════════════════════════════════════════════════════════════
       const candles = tf5m.candles;
-      if (candles.length >= 3) {
-        // Check if last 2 closes were both in extreme zone (bottom 30% or top 30% of candle)
+      if (candles.length >= 4) {
         if (rangeDirection === 'LONG') {
-          // Looking to buy at lower band - check if walking down
-          const last2 = candles.slice(-2);
-          const bothNearLow = last2.every(c => {
+          // Check if walking down (last 3 candles closed near lows)
+          const last3 = candles.slice(-3);
+          const allNearLow = last3.every(c => {
             const range = c.high - c.low;
             const position = range > 0 ? (c.close - c.low) / range : 0.5;
             return position < 0.3; // Closed in bottom 30% of candle
           });
-          if (bothNearLow) {
-            // Soft filter: reduce size, don't block
-            strength *= 0.5;
-            signals.push('WALK⚠');
+          if (allNearLow) {
+            return {
+              shouldEnter: false,
+              direction: rangeDirection,
+              strength,
+              signals,
+              reason: `RANGE: Band walk down (3 candles) - momentum continuing, not reversing`,
+              mlPrediction: 0.5,
+            };
           }
         } else if (rangeDirection === 'SHORT') {
-          // Looking to sell at upper band - check if walking up
-          const last2 = candles.slice(-2);
-          const bothNearHigh = last2.every(c => {
+          // Check if walking up (last 3 candles closed near highs)
+          const last3 = candles.slice(-3);
+          const allNearHigh = last3.every(c => {
             const range = c.high - c.low;
             const position = range > 0 ? (c.close - c.low) / range : 0.5;
             return position > 0.7; // Closed in top 30% of candle
           });
-          if (bothNearHigh) {
-            // Soft filter: reduce size, don't block
-            strength *= 0.5;
-            signals.push('WALK⚠');
+          if (allNearHigh) {
+            return {
+              shouldEnter: false,
+              direction: rangeDirection,
+              strength,
+              signals,
+              reason: `RANGE: Band walk up (3 candles) - momentum continuing, not reversing`,
+              mlPrediction: 0.5,
+            };
           }
         }
       }
-
-      // ═══════════════════════════════════════════════════════════════
-      // 4H TREND CHECK - SOFT (already applied trendMultiplier earlier)
-      // Counter-trend mean reversion allowed with smaller size
-      // ═══════════════════════════════════════════════════════════════
-      // Signal already added in initial 4H filter section
+      signals.push('NO_WALK✓');
 
       // Use mean reversion direction instead of momentum direction
       const direction_override = rangeDirection as 'LONG' | 'SHORT';
       const isLong = direction_override === 'LONG';
 
       // ═══════════════════════════════════════════════════════════════
-      // CANDLE CONFIRMATION - SOFT (reduce size, don't block)
+      // CANDLE CONFIRMATION - HARD FILTER
+      // Mean reversion needs reversal candle (engulfing/bullish/bearish)
+      // No confirmation = no entry
       // ═══════════════════════════════════════════════════════════════
       const candleTurning = isLong
         ? (m5.candleMomentum === 'bullish')
         : (m5.candleMomentum === 'bearish');
 
       if (!candleTurning) {
-        // Reduce size instead of blocking entirely
-        strength *= 0.5;
-        signals.push('CANDLE⚠');
-      } else {
-        signals.push('CANDLE✓');
+        return {
+          shouldEnter: false,
+          direction: direction_override,
+          strength,
+          signals,
+          reason: `RANGE: No candle confirmation - need ${isLong ? 'bullish' : 'bearish'} candle`,
+          mlPrediction: 0.5,
+        };
       }
+      signals.push('CANDLE✓');
       signals.push(`BB:${(bbPos * 100).toFixed(0)}%`);
 
-      // Volume spike REQUIRED (1.5x for RANGE mode, but NOT 3x+ exhaustion)
-      const volumeThreshold = CONFIG.momentum.volumeSpikeMultipleRange;  // 1.5x
-      const isExhaustion = m5.volumeRatio > 3.0;  // 3x+ = exhaustion spike, skip
+      // ═══════════════════════════════════════════════════════════════
+      // VOLUME - HARD FILTER
+      // No volume = no conviction = no entry
+      // ═══════════════════════════════════════════════════════════════
+      const volumeThreshold = CONFIG.momentum.volumeSpikeMultipleRange;  // 1.2x now
+      const isExhaustion = m5.volumeRatio > 4.0;  // 4x+ = exhaustion spike (was 3x - 3x is often the reversal we want)
 
       if (isExhaustion) {
         return {
@@ -1814,12 +1872,33 @@ class CoinTrader {
       }
 
       if (m5.volumeRatio < volumeThreshold) {
-        // Soft filter: reduce size but don't block (data collection)
-        strength *= 0.6;
-        signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x<${volumeThreshold}`);
-      } else {
-        signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x`);
+        return {
+          shouldEnter: false,
+          direction: direction_override,
+          strength,
+          signals,
+          reason: `RANGE: Volume ${m5.volumeRatio.toFixed(1)}x < ${volumeThreshold}x required - no conviction`,
+          mlPrediction: 0.5,
+        };
       }
+      signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x✓`);
+
+      // ═══════════════════════════════════════════════════════════════
+      // VWAP EXTENSION CHECK - HARD FILTER
+      // Price must be extended from VWAP for mean reversion
+      // ═══════════════════════════════════════════════════════════════
+      const vwapExtension = Math.abs(m5.vwapDeviation);
+      if (vwapExtension < 0.2) {  // Less than 0.2% from VWAP = not extended (was 0.1)
+        return {
+          shouldEnter: false,
+          direction: direction_override,
+          strength,
+          signals,
+          reason: `RANGE: VWAP not extended (${vwapExtension.toFixed(2)}%) - need > 0.1%`,
+          mlPrediction: 0.5,
+        };
+      }
+      signals.push(`VWAP:${vwapExtension.toFixed(2)}%✓`);
 
       // Williams %R confirmation (bonus signal)
       const williamsAtExtreme = isLong
@@ -1828,7 +1907,8 @@ class CoinTrader {
       if (williamsAtExtreme) signals.push('W%R✓');
 
       // ═══════════════════════════════════════════════════════════════
-      // R:R FILTER for RANGE mode - SOFT (reduce size, don't block)
+      // R:R FILTER for RANGE mode - HARD FILTER
+      // Stop too far = bad R:R = skip
       // ═══════════════════════════════════════════════════════════════
       const currentPrice = tf5m.candles[tf5m.candles.length - 1].close;
       const atrStopDistance = (m5.atr || currentPrice * 0.005) * 1.5;
@@ -1837,16 +1917,59 @@ class CoinTrader {
       const stopPct = (estimatedStopDistance / currentPrice) * 100;
 
       if (stopPct > 1.0) {
-        // Soft filter: reduce size for wider stops
-        strength *= 0.5;
-        signals.push(`SL:${stopPct.toFixed(1)}%`);
+        return {
+          shouldEnter: false,
+          direction: direction_override,
+          strength,
+          signals,
+          reason: `RANGE: Stop too far (${stopPct.toFixed(2)}% > 1%) - bad R:R`,
+          mlPrediction: 0.5,
+        };
       }
 
-      // NO kill zone bonus - data shows KZ hurts performance
-      // NO ML prediction for RANGE mode - let price action dictate
+      // ═══════════════════════════════════════════════════════════════
+      // LIQUIDITY CONFIRMATION - Stop hunt / fakeout detection
+      // Swept level + closed back = much higher probability entry
+      // ═══════════════════════════════════════════════════════════════
+      const liquidity = m5.liquiditySignals;
+      let liquidityScore = 0;
 
-      // Calculate final strength (bonus for confirmations)
-      const rangeStrength = Math.min(1, strength + (williamsAtExtreme ? 0.15 : 0) + (candleTurning ? 0.1 : 0));
+      if (liquidity) {
+        // If signals conflict with direction → skip
+        if (liquidity.bestDirection !== null && liquidity.bestDirection !== direction_override) {
+          return {
+            shouldEnter: false,
+            direction: direction_override,
+            strength,
+            signals,
+            reason: `RANGE: Liquidity signals oppose direction (${liquidity.signalTags.join(',')})`,
+            mlPrediction: 0.5,
+          };
+        }
+
+        // Push all signal tags for logging
+        if (liquidity.signalTags.length > 0) {
+          signals.push(...liquidity.signalTags);
+        }
+
+        liquidityScore = liquidity.liquidityScore;
+
+        // Optional hard gate - start at 0 to collect data
+        const MIN_LIQUIDITY_SCORE = 0;
+        if (liquidityScore < MIN_LIQUIDITY_SCORE) {
+          return {
+            shouldEnter: false,
+            direction: direction_override,
+            strength,
+            signals,
+            reason: `RANGE: Liquidity score too low (${liquidityScore} < ${MIN_LIQUIDITY_SCORE})`,
+            mlPrediction: 0.5,
+          };
+        }
+      }
+
+      // ALL HARD FILTERS PASSED - Full strength entry
+      const rangeStrength = Math.min(1, strength + (williamsAtExtreme ? 0.15 : 0));
 
       const bbZone = bbPos < CONFIG.regime.rangeLongThreshold ? 'lower' : 'upper';
       return {
@@ -1856,11 +1979,12 @@ class CoinTrader {
         signals,
         reason: `RANGE ${direction_override} @ BB ${bbZone}+VOL${williamsAtExtreme ? '+W%R' : ''}${candleTurning ? '+CANDLE' : ''}`,
         mlPrediction: 0.5,
+        liquidityScore,
       };
     }
   }
 
-  private enterTrade(analysis: { direction: 'LONG' | 'SHORT'; strength: number; signals: string[] }, currentPrice: number): void {
+  private enterTrade(analysis: { direction: 'LONG' | 'SHORT'; strength: number; signals: string[]; liquidityScore?: number }, currentPrice: number): void {
     const isLong = analysis.direction === 'LONG';
     const tf5m = this.state.timeframes.get('5m');
     const tf15m = this.state.timeframes.get('15m');
@@ -1984,7 +2108,19 @@ class CoinTrader {
     // Combine with signal strength
     const baseRiskPct = 0.5;  // 0.5% base risk
     const strengthMultiplier = 0.5 + analysis.strength * 1.0;  // 0.5x to 1.5x based on strength
-    const kellyRiskPct = baseRiskPct * kellyMultiplier * strengthMultiplier;
+    let kellyRiskPct = baseRiskPct * kellyMultiplier * strengthMultiplier;
+
+    // Liquidity quality multiplier — better setup = bigger position
+    const liqScore = analysis.liquidityScore ?? 0;
+    const liqMultiplier =
+      liqScore >= 75 ? 1.5 :    // sweep + QML + pattern = max size
+      liqScore >= 50 ? 1.25 :   // sweep + pattern = larger
+      liqScore >= 25 ? 1.0  :   // basic confirmation = standard
+      0.75;                     // no confirmation = reduced
+    kellyRiskPct *= liqMultiplier;
+
+    // Portfolio regime multiplier — reduce size in hostile market conditions
+    kellyRiskPct *= currentPortfolioRegime.sizeMultiplier;
 
     const riskAmount = this.state.balance * (kellyRiskPct / 100);
     let positionSize = riskAmount / stopDistance;
@@ -2034,6 +2170,7 @@ class CoinTrader {
       originalPositionSize: positionSize,
       currentPositionSize: positionSize,
       candlesHeld: 0,            // Track for time stop
+      lastCandleTime: 0,         // Track for incrementing candlesHeld on candle close
       tp1Hit: isMomentumMode,    // MOMENTUM: skip TP1 logic entirely
       tp2Hit: isMomentumMode,    // MOMENTUM: skip TP2 logic entirely
       phase2Active: false,       // Phase 2 trailing active
@@ -2045,7 +2182,7 @@ class CoinTrader {
     };
 
     this.state.openTrade = trade;
-    this.state.trades.push(trade);
+    // DON'T push to trades array here - only push when closed
     this.saveState();
 
     const usedSwing = isLong ? swingLow : swingHigh;
@@ -2073,6 +2210,10 @@ class CoinTrader {
     }
     console.log(`   Signals: ${analysis.signals.join(', ')}`);
     console.log(`   Strength: ${(analysis.strength * 100).toFixed(0)}% | Size: ${positionSize.toFixed(4)}`);
+    if (liqScore > 0) {
+      const liqTag = liqScore >= 75 ? '🔥' : liqScore >= 50 ? '✓' : liqScore >= 25 ? '·' : '⚠';
+      console.log(`   Liquidity: ${liqScore}/100 ${liqTag} (${liqMultiplier}x size)`);
+    }
   }
 
   private checkOpenTrade(currentPrice: number, candleLow: number = currentPrice, candleHigh: number = currentPrice, currentCandleTime: number = 0): { closed: boolean; message: string } {
@@ -2081,9 +2222,9 @@ class CoinTrader {
 
     // Increment candle counter only when candle actually changes (not every check cycle)
     // currentCandleTime is the timestamp of the current 5m candle
-    if (currentCandleTime > 0 && (trade as any).lastCandleTime !== currentCandleTime) {
+    if (currentCandleTime > 0 && trade.lastCandleTime !== currentCandleTime) {
       trade.candlesHeld++;
-      (trade as any).lastCandleTime = currentCandleTime;
+      trade.lastCandleTime = currentCandleTime;
     }
 
     const priceDiff = isLong ? currentPrice - trade.entryPrice : trade.entryPrice - currentPrice;
@@ -2667,6 +2808,20 @@ function writeLiveSummary(
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // PORTFOLIO REGIME: Classify market state across all coins
+    // ═══════════════════════════════════════════════════════════════
+    const regimeSignals: CoinRegimeSignals[] = [];
+    for (const trader of traders) {
+      const tf = trader.state.timeframes.get(CONFIG.primaryInterval);
+      if (tf && tf.momentum) {
+        regimeSignals.push(extractRegimeSignals(trader.state.symbol, tf.momentum));
+      }
+    }
+    if (regimeSignals.length > 0) {
+      currentPortfolioRegime = regimeDetector.classify(regimeSignals);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // DISPLAY: Summary mode (clean) or Verbose mode (all coins)
     // ═══════════════════════════════════════════════════════════════
     const isVerbose = CONFIG.reporting.mode === 'verbose';
@@ -2754,12 +2909,85 @@ function writeLiveSummary(
     console.log(`📊 SUMMARY: Open: ${openCount} | Trades: ${totalTrades} (${totalWins}W/${totalLosses}L) | Win: ${winRate}%`);
     console.log(`           PnL: ${pnlColor} ${pnlSign}$${totalPnl.toFixed(2)} | Unrealized: ${unrealizedColor} ${unrealizedSign}$${unrealizedPnl.toFixed(2)}`);
     console.log(`           Streak: ${currentStreakType} (${currentStreak})`);
+    // Portfolio regime display
+    const regimeColor = currentPortfolioRegime.regime === 'RISK_ON' ? '🟢' :
+                        currentPortfolioRegime.regime === 'RISK_OFF' ? '🔴' : '🟡';
+    console.log(`           Regime: ${regimeColor} ${currentPortfolioRegime.regime} (${(currentPortfolioRegime.sizeMultiplier * 100).toFixed(0)}% size) | ADX: ${currentPortfolioRegime.metrics.avgAdx.toFixed(1)} | Trending: ${currentPortfolioRegime.metrics.trendingCoinCount}/${currentPortfolioRegime.metrics.totalCoinCount}`);
     console.log('═══════════════════════════════════════════════════════════════\n');
 
     // ═══════════════════════════════════════════════════════════════
     // LIVE SUMMARY: Write to JSON file for OpenClaw integration
     // ═══════════════════════════════════════════════════════════════
     writeLiveSummary(traders, iteration, results);
+
+    // ═══════════════════════════════════════════════════════════════
+    // PARAMETER ANALYSIS: Bucket analysis every N trades
+    // ═══════════════════════════════════════════════════════════════
+    if (parameterAnalyzer.shouldAnalyze(totalTrades)) {
+      console.log(`\n📊 PARAMETER ANALYSIS: Analyzing ${totalTrades} trades...`);
+
+      // Collect all closed trades from all traders
+      const allClosedTrades: ClosedTrade[] = [];
+      for (const trader of traders) {
+        for (const t of trader.state.trades) {
+          if (t.status !== 'CLOSED') continue;
+          allClosedTrades.push({
+            symbol: t.symbol,
+            direction: t.direction,
+            entryPrice: t.entryPrice,
+            exitPrice: t.exitPrice || 0,
+            pnl: t.pnl || 0,
+            status: 'CLOSED',
+            entryTime: t.entryTime,
+            exitTime: t.exitTime || 0,
+            regime: (t as any).entryFeatures?.regime,
+            bbPosition: (t as any).entryFeatures?.bbPosition,
+            volumeRatio: (t as any).entryFeatures?.volumeRatio,
+            rsi: (t as any).entryFeatures?.rsiValue,
+            holdCandles: t.candlesHeld,
+            liquidityScore: (t as any).liquidityScore,
+            signalStrength: (t as any).entryFeatures?.strength,
+          });
+        }
+      }
+
+      if (allClosedTrades.length >= DEFAULT_CONFIG.minTradesPerBucket) {
+        lastAnalysisResult = parameterAnalyzer.analyze(allClosedTrades);
+        parameterAnalyzer.markAnalyzed(totalTrades);
+
+        console.log(`   ${lastAnalysisResult.summary}`);
+        if (lastAnalysisResult.suggestions.length > 0) {
+          console.log('\n   📋 SUGGESTIONS:');
+          console.log('   ' + formatSuggestions(lastAnalysisResult.suggestions).replace(/\n/g, '\n   '));
+        }
+        console.log('');
+
+        // ═══════════════════════════════════════════════════════════════
+        // LLM REPORT: Send to GLM 5 for intelligent recommendations
+        // ═══════════════════════════════════════════════════════════════
+        if (llmReporter.isEnabled() && llmReporter.shouldCall()) {
+          console.log('   🤖 Sending analysis to GLM 5...');
+          try {
+            lastLLMReport = await llmReporter.getRecommendations(lastAnalysisResult);
+            if (lastLLMReport.recommendations.length > 0) {
+              console.log('   ' + formatRecommendations(lastLLMReport).replace(/\n/g, '\n   '));
+            } else if (lastLLMReport.error) {
+              console.log(`   ⚠️ LLM: ${lastLLMReport.error}`);
+            }
+          } catch (e: any) {
+            console.log(`   ⚠️ LLM error: ${e.message}`);
+          }
+          console.log('');
+        }
+      }
+    }
+
+    // Show last analysis suggestions in summary (if available)
+    if (lastAnalysisResult && lastAnalysisResult.suggestions.length > 0) {
+      const topSuggestion = lastAnalysisResult.suggestions[0];
+      const impactIcon = topSuggestion.impact === 'HIGH' ? '🔴' : topSuggestion.impact === 'MEDIUM' ? '🟡' : '🟢';
+      console.log(`💡 LAST ANALYSIS: ${impactIcon} ${topSuggestion.current} → ${topSuggestion.suggested}`);
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // AUTO-LEARNING: Trigger retraining every N trades
