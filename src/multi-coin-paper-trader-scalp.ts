@@ -2939,13 +2939,22 @@ function writeLiveSummary(
         const pnlSign = unrealizedPnl >= 0 ? '+' : '';
         const pricePrecision = getDecimalPlaces(trade.entryPrice);
 
-        // TP hit indicators
-        const tp1 = trade.tp1Hit ? '✓' : ' ';
-        const tp2 = trade.tp2Hit ? '✓' : ' ';
+        // TP hit indicators (MOMENTUM mode uses trailing, not TPs)
+        let tpDisplay: string;
+        if (trade.isMomentumMode) {
+          // MOMENTUM: Show trail status instead of TP targets
+          const trailStatus = trade.phase2Active ? 'TRAILING' : 'WAIT→0.5R';
+          tpDisplay = `[${trailStatus}]`;
+        } else {
+          // RANGE: Show TP1/TP2 with hit indicators
+          const tp1 = trade.tp1Hit ? '✓' : ' ';
+          const tp2 = trade.tp2Hit ? '✓' : ' ';
+          tpDisplay = `[${tp1}]$${trade.takeProfit1.toFixed(pricePrecision)} [${tp2}]$${trade.takeProfit2.toFixed(pricePrecision)}`;
+        }
 
         const currentPriceDisplay = price > 0 ? `$${price.toFixed(pricePrecision)}` : '$---';
         const phaseInfo = trade.phase2Active ? ' [P2]' : '';
-        console.log(`   ${symbol}: ${trade.direction} | ${currentPriceDisplay} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(2)}%) | TP: [${tp1}]$${trade.takeProfit1.toFixed(pricePrecision)} [${tp2}]$${trade.takeProfit2.toFixed(pricePrecision)}${phaseInfo} | SL:$${trade.stopLoss.toFixed(pricePrecision)}`);
+        console.log(`   ${symbol}: ${trade.direction} | ${currentPriceDisplay} | ${pnlSign}$${unrealizedPnl.toFixed(2)} (${pnlSign}${pnlPercent.toFixed(2)}%) | TP: ${tpDisplay}${phaseInfo} | SL:$${trade.stopLoss.toFixed(pricePrecision)}`);
       }
     }
 
