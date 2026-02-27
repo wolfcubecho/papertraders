@@ -2363,27 +2363,10 @@ class CoinTrader {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // TIME STOP - Exit after N candles IF no movement
-    // "No movement" = price within 0.5R of entry
+    // NO TIMEOUT - Let trades run until SL or TP
+    // For reversals: if thesis is right → TP hit, if wrong → SL hit
+    // For momentum: trail until stopped out
     // ═══════════════════════════════════════════════════════════════
-    if (trade.candlesHeld >= CONFIG.targets.timeStopCandles) {
-      // Calculate R-based movement: how far from entry in R units
-      const priceMovement = Math.abs(currentPrice - trade.entryPrice);
-      const movementInR = priceMovement / trade.tp1DistanceR;  // R = tp1DistanceR
-
-      // Only time out if "no movement" (less than 0.5R from entry)
-      if (movementInR < 0.5) {
-        return this.closeTrade(currentPrice, 'TIMEOUT', pnl, pnlPercent);
-      }
-      // If there's meaningful movement, let it run
-    }
-
-    // Also check minute-based timeout for very long holds
-    const holdTime = Date.now() - trade.entryTime;
-    const maxHoldMs = CONFIG.maxHoldMinutes * 60 * 1000;
-    if (holdTime > maxHoldMs) {
-      return this.closeTrade(currentPrice, 'TIMEOUT', pnl, pnlPercent);
-    }
 
     // Use candle extremes for SL/TP checks to catch wicks
     // For LONG: SL triggers on low, TP triggers on high

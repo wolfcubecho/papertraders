@@ -2497,42 +2497,11 @@ class CoinTrader {
       }
     }
 
-    // Timeout with "no movement" check
-    if (CONFIG.maxHoldHours > 0) {
-      const heldMs = Date.now() - trade.entryTime;
-      const maxHoldMs = CONFIG.maxHoldHours * 60 * 60 * 1000;
-
-      // Early timeout check at 24 hours with "no movement" condition
-      const earlyTimeoutMs = 24 * 60 * 60 * 1000; // 24 hours
-      if (heldMs >= earlyTimeoutMs && heldMs < maxHoldMs) {
-        // Calculate R-based movement: how far from entry in R units
-        const stopDistance = Math.abs(trade.entryPrice - trade.originalStopLoss);
-        const priceMovement = Math.abs(currentPrice - trade.entryPrice);
-        const movementInR = stopDistance > 0 ? priceMovement / stopDistance : 0;
-
-        // Exit if "no movement" (less than 0.5R from entry after 24h)
-        if (movementInR < 0.5) {
-          await this.closeTrade(currentPrice, 'TIMEOUT');
-          return {
-            closed: true,
-            message: `TIMEOUT (24h, no movement: ${movementInR.toFixed(2)}R)`,
-            pnl: unrealizedPnl, pnlPercent,
-            pnlSign: unrealizedPnl >= 0 ? '+' : '',
-          };
-        }
-      }
-
-      // Final timeout at max hold hours
-      if (heldMs >= maxHoldMs) {
-        await this.closeTrade(currentPrice, 'TIMEOUT');
-        return {
-          closed: true,
-          message: `TIMEOUT (${CONFIG.maxHoldHours}h)`,
-          pnl: unrealizedPnl, pnlPercent,
-          pnlSign: unrealizedPnl >= 0 ? '+' : '',
-        };
-      }
-    }
+    // ═══════════════════════════════════════════════════════════════
+    // NO TIMEOUT - Let trades run until SL or TP
+    // For reversals: if thesis is right → TP hit, if wrong → SL hit
+    // For momentum: trail until stopped out
+    // ═══════════════════════════════════════════════════════════════
 
     const pnlSign = unrealizedPnl >= 0 ? '+' : '';
     const tpInfo = [trade.tp1Hit ? 'TP1' : '', trade.tp2Hit ? 'TP2' : ''].filter(Boolean).join('+') || '';
