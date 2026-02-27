@@ -231,7 +231,7 @@ interface MomentumSignals {
   macdBearishCross: boolean;
   atr: number;
   atrPercent: number;
-  regime: 'MOMENTUM' | 'RANGE' | 'NONE';
+  regime: 'MOMENTUM' | 'RANGE';
   adx: number;
   plusDI: number;
   minusDI: number;
@@ -679,7 +679,7 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
       candleMomentum: 'neutral',
       macdLine: 0, macdSignal: 0, macdHistogram: 0,
       macdBullishCross: false, macdBearishCross: false,
-      atr: 0, atrPercent: 0, regime: 'NONE' as const,
+      atr: 0, atrPercent: 0, regime: 'RANGE' as const,
       adx: 0, plusDI: 0, minusDI: 0,
       vwap: 0, vwapDeviation: 0, vwapDeviationStd: 0, priceAboveVwap: false,
       sessionVwapAsia: 0, sessionVwapLondon: 0, sessionVwapNy: 0,
@@ -799,18 +799,14 @@ function analyzeMomentum(candles: Candle[]): MomentumSignals {
   // Hysteresis: Use previous regime to prevent flickering
   // - If was MOMENTUM, stay MOMENTUM until ADX drops below 25
   // - If was RANGE, stay RANGE until ADX exceeds 30
-  let regime: 'MOMENTUM' | 'RANGE' | 'NONE';
+  // NO NONE ZONE - always either MOMENTUM or RANGE
+  let regime: 'MOMENTUM' | 'RANGE';
 
-  // Primary: ADX-based regime, BB expansion is bonus confirmation not requirement
-  if (adx >= CONFIG.regime.adxMomentumMin) {
-    // ADX > 30 = clear trend, trade momentum regardless of BB expansion
+  // Simplified: ADX >= 28 = MOMENTUM, else RANGE (no dead zone)
+  if (adx >= 28) {
     regime = 'MOMENTUM';
-  } else if (adx <= CONFIG.regime.adxRangeMax) {
-    // ADX < 25 = range-bound, mean reversion
-    regime = 'RANGE';
   } else {
-    // ADX 25-30 = transition zone, no clear edge
-    regime = 'NONE';
+    regime = 'RANGE';
   }
 
   // VWAP - Multi-session
@@ -989,7 +985,7 @@ function applySMCContext(
 interface MarketSnapshot {
   price: number;
   timestamp: number;
-  regime: 'MOMENTUM' | 'RANGE' | 'NONE';
+  regime: 'MOMENTUM' | 'RANGE';
   atrPercent: number;
   bbPosition: number;
   bbWidth: number;
@@ -1187,7 +1183,7 @@ interface PaperTrade {
   pnl?: number;
   pnlPercent?: number;
   mlPrediction: number;
-  regime: 'MOMENTUM' | 'RANGE' | 'NONE';
+  regime: 'MOMENTUM' | 'RANGE';
   qualityScore: number;
   smcContext: string[];
   entryFeatures?: MarketSnapshot;
@@ -1616,7 +1612,7 @@ class CoinTrader {
   private analyzeForEntry(): {
     shouldEnter: boolean;
     direction: 'LONG' | 'SHORT' | 'NEUTRAL';
-    regime: 'MOMENTUM' | 'RANGE' | 'NONE';
+    regime: 'MOMENTUM' | 'RANGE';
     mlPrediction: number;
     qualityScore: number;
     smcContext: SMCContext;
@@ -1624,7 +1620,7 @@ class CoinTrader {
     reason: string;
     liquidityScore?: number;
   } {
-    const noEntry = (reason: string, direction: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL', regime: 'MOMENTUM' | 'RANGE' | 'NONE' = 'NONE', mlPrediction: number = 0.5, qualityScore: number = 0, smcContext: any = { stopTighten: 1, sizeMultiplier: 1, confidenceBoost: 0, adjustments: [] }) => ({
+    const noEntry = (reason: string, direction: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL', regime: 'MOMENTUM' | 'RANGE' = 'RANGE', mlPrediction: number = 0.5, qualityScore: number = 0, smcContext: any = { stopTighten: 1, sizeMultiplier: 1, confidenceBoost: 0, adjustments: [] }) => ({
       shouldEnter: false,
       direction,
       regime,
@@ -1691,14 +1687,10 @@ class CoinTrader {
     // - Never block trades purely on weekly alignment (miss too many opportunities)
     // ═══════════════════════════════════════════════════════════════
 
-    // NONE: Don't trade (transition/squeeze - no edge)
+    // NO NONE ZONE - always either MOMENTUM or RANGE
     signals.push(`${regime}`);
     signals.push(`ADX:${m4h.adx?.toFixed(0) || '?'}`);
     signals.push(m4h.bbExpanding ? 'BB↑↑' : `BW:${m4h.bbWidth?.toFixed(1)}%`);
-
-    if (regime === 'NONE') {
-      return noEntry(`NONE: ADX ${m4h.adx?.toFixed(0) || '?'} + BB ${m4h.bbExpanding ? 'expanding' : 'normal'} = transition zone - skip`, direction, 'NONE');
-    }
 
     // ═══════════════════════════════════════════════════════════════
     // 4H TREND FILTER - SOFT FILTER (reduces size, doesn't block)
@@ -1767,15 +1759,10 @@ class CoinTrader {
 
     } else {
       // ═══════════════════════════════════════════════════════════════
-      // RANGE MODE: Only mean revert if NO strong trend (ADX < 20)
-      // In strong trends, price walks bands - don't catch falling knives!
+      // RANGE MODE: Mean reversion (ADX < 28)
+      // Entry: At BB extremes, look for reversal
+      // Exit: TP1/TP2/TP3 based on R multiples
       // ═══════════════════════════════════════════════════════════════
-
-      // ADX check: If trend is strong, skip mean reversion
-      if (m4h.adx && m4h.adx > CONFIG.regime.adxRangeMax) {
-        return { ...noEntry(`RANGE: ADX ${m4h.adx.toFixed(0)} > ${CONFIG.regime.adxRangeMax} - trend too strong for mean reversion`, direction, 'RANGE'), signals };
-      }
-      signals.push(`ADX:${m4h.adx?.toFixed(0) || '?'}<${CONFIG.regime.adxRangeMax}`);
 
       let rangeDirection: 'LONG' | 'SHORT' | 'SKIP' = 'SKIP';
       if (m4h.bbPosition < CONFIG.momentum.bbExtremeLong) {
@@ -2236,7 +2223,7 @@ class CoinTrader {
     // ─────────────────────────────────────────────────────────────────
     const tf4h = this.state.timeframes.get('4h');
     const coinAdx = tf4h?.momentum?.adx || 0;
-    const coinRegime = tf4h?.momentum?.regime || 'NONE';
+    const coinRegime = tf4h?.momentum?.regime || 'RANGE';
 
     // Gate weak setups in hostile markets
     if (regimeDetector.shouldGateCoin(coinAdx, coinRegime)) {
