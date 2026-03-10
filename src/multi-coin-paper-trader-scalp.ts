@@ -1789,157 +1789,22 @@ class CoinTrader {
         };
       }
 
-      // ═══════════════════════════════════════════════════════════════
-      // OFI FILTER - Order Flow Imbalance at BB extremes (optional)
-      // Only filter if we have actual OFI data (not default 0)
-      // ═══════════════════════════════════════════════════════════════
-      const ofi = m5.ofi || 0;
-      const hasOfiData = m5.ofi !== undefined && m5.ofi !== 0;
-      const ofiThreshold = 0.3;
-
-      if (hasOfiData) {
-        if (rangeDirection === 'LONG' && ofi < ofiThreshold) {
-          return {
-            shouldEnter: false,
-            direction: rangeDirection,
-            strength,
-            signals,
-            reason: `RANGE: OFI ${ofi.toFixed(2)} < ${ofiThreshold} - no buying pressure at lower BB`,
-            mlPrediction: 0.5,
-          };
-        }
-        if (rangeDirection === 'SHORT' && ofi > -ofiThreshold) {
-          return {
-            shouldEnter: false,
-            direction: rangeDirection,
-            strength,
-            signals,
-            reason: `RANGE: OFI ${ofi.toFixed(2)} > -${ofiThreshold} - no selling pressure at upper BB`,
-            mlPrediction: 0.5,
-          };
-        }
-        signals.push(`OFI:${ofi > 0 ? '+' : ''}${ofi.toFixed(2)}`);
-      }
-
-      // ═══════════════════════════════════════════════════════════════
-      // BAND WALK DETECTION - HARD FILTER
-      // If price closed in extreme zone for 3+ candles = walking, not reversing
-      // Walking = momentum continuing, NOT reversing - BLOCK ENTRY
-      // ═══════════════════════════════════════════════════════════════
-      const candles = tf5m.candles;
-      if (candles.length >= 4) {
-        if (rangeDirection === 'LONG') {
-          // Check if walking down (last 3 candles closed near lows)
-          const last3 = candles.slice(-3);
-          const allNearLow = last3.every(c => {
-            const range = c.high - c.low;
-            const position = range > 0 ? (c.close - c.low) / range : 0.5;
-            return position < 0.3; // Closed in bottom 30% of candle
-          });
-          if (allNearLow) {
-            return {
-              shouldEnter: false,
-              direction: rangeDirection,
-              strength,
-              signals,
-              reason: `RANGE: Band walk down (3 candles) - momentum continuing, not reversing`,
-              mlPrediction: 0.5,
-            };
-          }
-        } else if (rangeDirection === 'SHORT') {
-          // Check if walking up (last 3 candles closed near highs)
-          const last3 = candles.slice(-3);
-          const allNearHigh = last3.every(c => {
-            const range = c.high - c.low;
-            const position = range > 0 ? (c.close - c.low) / range : 0.5;
-            return position > 0.7; // Closed in top 30% of candle
-          });
-          if (allNearHigh) {
-            return {
-              shouldEnter: false,
-              direction: rangeDirection,
-              strength,
-              signals,
-              reason: `RANGE: Band walk up (3 candles) - momentum continuing, not reversing`,
-              mlPrediction: 0.5,
-            };
-          }
-        }
-      }
-      signals.push('NO_WALK✓');
-
       // Use mean reversion direction instead of momentum direction
       const direction_override = rangeDirection as 'LONG' | 'SHORT';
       const isLong = direction_override === 'LONG';
 
-      // ═══════════════════════════════════════════════════════════════
-      // CANDLE CONFIRMATION - HARD FILTER
-      // Mean reversion needs reversal candle (engulfing/bullish/bearish)
-      // No confirmation = no entry
-      // ═══════════════════════════════════════════════════════════════
+      // Candle confirmation (soft signal, not hard filter)
       const candleTurning = isLong
         ? (m5.candleMomentum === 'bullish')
         : (m5.candleMomentum === 'bearish');
-
-      if (!candleTurning) {
-        return {
-          shouldEnter: false,
-          direction: direction_override,
-          strength,
-          signals,
-          reason: `RANGE: No candle confirmation - need ${isLong ? 'bullish' : 'bearish'} candle`,
-          mlPrediction: 0.5,
-        };
-      }
-      signals.push('CANDLE✓');
+      if (candleTurning) signals.push('CANDLE✓');
       signals.push(`BB:${(bbPos * 100).toFixed(0)}%`);
 
       // ═══════════════════════════════════════════════════════════════
-      // VOLUME - HARD FILTER
-      // No volume = no conviction = no entry
+      // VOLUME - SOFT FILTER (just log, don't block)
+      // Volume info for logging only - reversals can happen on low volume too
       // ═══════════════════════════════════════════════════════════════
-      const volumeThreshold = CONFIG.momentum.volumeSpikeMultipleRange;  // 1.2x now
-      const isExhaustion = m5.volumeRatio > 4.0;  // 4x+ = exhaustion spike (was 3x - 3x is often the reversal we want)
-
-      if (isExhaustion) {
-        return {
-          shouldEnter: false,
-          direction: direction_override,
-          strength,
-          signals,
-          reason: `RANGE: Volume exhaustion (${m5.volumeRatio.toFixed(1)}x > 3x) - skip`,
-          mlPrediction: 0.5,
-        };
-      }
-
-      if (m5.volumeRatio < volumeThreshold) {
-        return {
-          shouldEnter: false,
-          direction: direction_override,
-          strength,
-          signals,
-          reason: `RANGE: Volume ${m5.volumeRatio.toFixed(1)}x < ${volumeThreshold}x required - no conviction`,
-          mlPrediction: 0.5,
-        };
-      }
-      signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x✓`);
-
-      // ═══════════════════════════════════════════════════════════════
-      // VWAP EXTENSION CHECK - HARD FILTER
-      // Price must be extended from VWAP for mean reversion
-      // ═══════════════════════════════════════════════════════════════
-      const vwapExtension = Math.abs(m5.vwapDeviation);
-      if (vwapExtension < 0.2) {  // Less than 0.2% from VWAP = not extended (was 0.1)
-        return {
-          shouldEnter: false,
-          direction: direction_override,
-          strength,
-          signals,
-          reason: `RANGE: VWAP not extended (${vwapExtension.toFixed(2)}%) - need > 0.1%`,
-          mlPrediction: 0.5,
-        };
-      }
-      signals.push(`VWAP:${vwapExtension.toFixed(2)}%✓`);
+      signals.push(`VOL:${m5.volumeRatio.toFixed(1)}x`);
 
       // Williams %R confirmation (bonus signal)
       const williamsAtExtreme = isLong
@@ -1969,44 +1834,18 @@ class CoinTrader {
       }
 
       // ═══════════════════════════════════════════════════════════════
-      // LIQUIDITY CONFIRMATION - Stop hunt / fakeout detection
-      // Swept level + closed back = much higher probability entry
+      // LIQUIDITY INFO - Informational only (no hard gates)
+      // Log liquidity signals for analysis, but don't block entries
       // ═══════════════════════════════════════════════════════════════
       const liquidity = m5.liquiditySignals;
       let liquidityScore = 0;
 
       if (liquidity) {
-        // If signals conflict with direction → skip
-        if (liquidity.bestDirection !== null && liquidity.bestDirection !== direction_override) {
-          return {
-            shouldEnter: false,
-            direction: direction_override,
-            strength,
-            signals,
-            reason: `RANGE: Liquidity signals oppose direction (${liquidity.signalTags.join(',')})`,
-            mlPrediction: 0.5,
-          };
-        }
-
         // Push all signal tags for logging
         if (liquidity.signalTags.length > 0) {
           signals.push(...liquidity.signalTags);
         }
-
         liquidityScore = liquidity.liquidityScore;
-
-        // Optional hard gate - start at 0 to collect data
-        const MIN_LIQUIDITY_SCORE = 0;
-        if (liquidityScore < MIN_LIQUIDITY_SCORE) {
-          return {
-            shouldEnter: false,
-            direction: direction_override,
-            strength,
-            signals,
-            reason: `RANGE: Liquidity score too low (${liquidityScore} < ${MIN_LIQUIDITY_SCORE})`,
-            mlPrediction: 0.5,
-          };
-        }
       }
 
       // ALL HARD FILTERS PASSED - Full strength entry

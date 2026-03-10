@@ -1776,56 +1776,6 @@ class CoinTrader {
       }
 
       // ═══════════════════════════════════════════════════════════════
-      // BAND WALK DETECTION - HARD FILTER
-      // 3 consecutive 4H candles closing at extreme = trend, not range
-      // ═══════════════════════════════════════════════════════════════
-      const candles4h = tf4h.candles;
-      if (candles4h.length >= 4) {
-        if (rangeDirection === 'LONG') {
-          const last3 = candles4h.slice(-3);
-          const walking = last3.every(c => {
-            const range = c.high - c.low;
-            return range > 0 ? (c.close - c.low) / range < 0.3 : false;
-          });
-          if (walking) {
-            return { ...noEntry(`RANGE: Band walk down on 4H (3 candles) - trend not range`, rangeDirection, 'RANGE'), signals };
-          }
-        } else {
-          const last3 = candles4h.slice(-3);
-          const walking = last3.every(c => {
-            const range = c.high - c.low;
-            return range > 0 ? (c.close - c.low) / range > 0.7 : false;
-          });
-          if (walking) {
-            return { ...noEntry(`RANGE: Band walk up on 4H (3 candles) - trend not range`, rangeDirection, 'RANGE'), signals };
-          }
-        }
-      }
-      signals.push('NO_WALK✓');
-
-      // ═══════════════════════════════════════════════════════════════
-      // CANDLE CONFIRMATION - HARD FILTER
-      // Need reversal candle at the extreme
-      // ═══════════════════════════════════════════════════════════════
-      const candleTurning = rangeDirection === 'LONG'
-        ? m4h.candleMomentum === 'bullish'
-        : m4h.candleMomentum === 'bearish';
-
-      if (!candleTurning) {
-        return { ...noEntry(`RANGE: No reversal candle - need ${rangeDirection === 'LONG' ? 'bullish' : 'bearish'} 4H candle`, rangeDirection, 'RANGE'), signals };
-      }
-      signals.push('CANDLE✓');
-
-      // ═══════════════════════════════════════════════════════════════
-      // VOLUME - HARD FILTER
-      // REQUIRED on 4H (was optional)
-      // ═══════════════════════════════════════════════════════════════
-      if (m4h.volumeRatio < CONFIG.momentum.volumeSpikeMultipleRange) {
-        return { ...noEntry(`RANGE: Volume ${m4h.volumeRatio.toFixed(1)}x < ${CONFIG.momentum.volumeSpikeMultipleRange}x - no conviction`, rangeDirection, 'RANGE'), signals };
-      }
-      signals.push(`VOL:${m4h.volumeRatio.toFixed(1)}x✓`);
-
-      // ═══════════════════════════════════════════════════════════════
       // SOFT 4H TREND CHECK: Counter-trend allowed with smaller size
       // The initial trend filter already set trendMultiplier, just add signal
       // ═══════════════════════════════════════════════════════════════
@@ -1834,48 +1784,25 @@ class CoinTrader {
         signals.push('4h↔');  // Already marked as counter-trend
       }
 
-      // ═══════════════════════════════════════════════════════════════
-      // OFI FILTER - Order Flow Imbalance at BB extremes (optional)
-      // Only filter if we have actual OFI data (not default 0)
-      // ═══════════════════════════════════════════════════════════════
-      const ofi = m4h.ofi || 0;
-      const hasOfiData = m4h.ofi !== undefined && m4h.ofi !== 0;
-      const ofiThreshold = 0.3;
+      // Candle confirmation (soft signal, not hard filter)
+      const candleTurning = rangeDirection === 'LONG'
+        ? m4h.candleMomentum === 'bullish'
+        : m4h.candleMomentum === 'bearish';
+      if (candleTurning) signals.push('CANDLE✓');
 
-      if (hasOfiData) {
-        if (rangeDirection === 'LONG' && ofi < ofiThreshold) {
-          return { ...noEntry(`RANGE: OFI ${ofi.toFixed(2)} < ${ofiThreshold} - no buying pressure at lower BB`, rangeDirection, 'RANGE'), signals };
-        }
-        if (rangeDirection === 'SHORT' && ofi > -ofiThreshold) {
-          return { ...noEntry(`RANGE: OFI ${ofi.toFixed(2)} > -${ofiThreshold} - no selling pressure at upper BB`, rangeDirection, 'RANGE'), signals };
-        }
-        signals.push(`OFI:${ofi > 0 ? '+' : ''}${ofi.toFixed(2)}`);
-      }
+      // Volume info (soft signal, not hard filter)
+      signals.push(`VOL:${m4h.volumeRatio.toFixed(1)}x`);
 
       // ═══════════════════════════════════════════════════════════════
-      // LIQUIDITY CONFIRMATION - Stop hunt / fakeout detection
-      // Swept level + closed back = much higher probability entry
+      // LIQUIDITY INFO - Informational only (no hard gates)
+      // Log liquidity signals for analysis, but don't block entries
       // ═══════════════════════════════════════════════════════════════
       const liquidity = m4h.liquiditySignals;
-
       if (liquidity) {
-        // If signals conflict with direction → skip
-        if (liquidity.bestDirection !== null && liquidity.bestDirection !== rangeDirection) {
-          return { ...noEntry(`RANGE: Liquidity signals oppose direction (${liquidity.signalTags.join(',')})`, rangeDirection, 'RANGE'), signals };
-        }
-
-        // Push all signal tags for logging
         if (liquidity.signalTags.length > 0) {
           signals.push(...liquidity.signalTags);
         }
-
         liquidityScore = liquidity.liquidityScore;
-
-        // Optional hard gate - start at 0 to collect data
-        const MIN_LIQUIDITY_SCORE = 0;
-        if (liquidityScore < MIN_LIQUIDITY_SCORE) {
-          return { ...noEntry(`RANGE: Liquidity score too low (${liquidityScore} < ${MIN_LIQUIDITY_SCORE})`, rangeDirection, 'RANGE'), signals };
-        }
       }
 
       // Override direction for mean reversion
